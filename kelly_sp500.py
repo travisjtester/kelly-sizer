@@ -22,7 +22,7 @@ import argparse
 import io
 import sys
 import time
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import numpy as np
@@ -316,6 +316,18 @@ def default_output() -> Path:
     return folder / f"kelly_sp500_{date.today():%Y-%m-%d}.csv"
 
 
+def safe_to_csv(df: pd.DataFrame, path: Path) -> Path:
+    """Write CSV; if the file is locked (open in Excel), use a timestamped name."""
+    try:
+        df.to_csv(path, index=False)
+        return path
+    except PermissionError:
+        alt = path.with_name(f"{path.stem}_{datetime.now():%H%M%S}{path.suffix}")
+        log(f"{path.name} is open/locked (Excel?). Writing {alt.name} instead.")
+        df.to_csv(alt, index=False)
+        return alt
+
+
 def lookup_extra_meta(tickers: list[str]) -> pd.DataFrame:
     """Name/sector for non-S&P tickers (a few .info calls, best effort)."""
     import yfinance as yf
@@ -409,7 +421,7 @@ def main(argv: list[str] | None = None) -> int:
 
     out = args.out or default_output()
     out.parent.mkdir(parents=True, exist_ok=True)
-    res.to_csv(out, index=False)
+    out = safe_to_csv(res, out)
     log(f"\nSaved: {out}")
 
     # ---- optional portfolio Kelly
@@ -432,8 +444,8 @@ def main(argv: list[str] | None = None) -> int:
         stamp = f"{date.today():%Y-%m-%d}"
         w_path = out.parent / f"kelly_portfolio_{stamp}.csv"
         s_path = out.parent / f"kelly_portfolio_summary_{stamp}.csv"
-        weights.to_csv(w_path, index=False)
-        summary.to_csv(s_path, index=False)
+        w_path = safe_to_csv(weights, w_path)
+        s_path = safe_to_csv(summary, s_path)
         wcols = ["ticker", "weight_full_kelly", "weight_half_kelly",
                  "weight_quarter_kelly", "standalone_full_kelly"]
         with pd.option_context("display.float_format", "{:.3f}".format,
