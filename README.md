@@ -10,6 +10,7 @@ pip install -r requirements.txt
 ```
 
 ## Run
+Windows: use PowerShell or a VS Code terminal. Quote paths that contain spaces (`cd "C:\...\Python Scripts\kelly-sp500"`); use `py` if `python` isn't recognized.
 ```bash
 python kelly_sp500.py                         # full index -> Desktop/kelly_sp500_YYYY-MM-DD.csv
 python kelly_sp500.py --limit 25              # quick smoke test
@@ -25,6 +26,12 @@ python kelly_sp500.py --portfolio-top 15
 python kelly_sp500.py --portfolio-top 15 --max-weight 0.15 --max-leverage 1.0
 ```
 Writes two extra files next to the main CSV: `kelly_portfolio_YYYY-MM-DD.csv` (weights) and `kelly_portfolio_summary_YYYY-MM-DD.csv` (portfolio stats per Kelly fraction). Tickers passed to `--portfolio` are downloaded automatically even if they're not in the index.
+
+**Basket rules**
+- Names with under 60 months of history are dropped and logged (e.g. recent IPOs like ARM).
+- Covariance uses only the months **all** remaining names share; the console logs the window and which ticker limits it. One young name shortens the window for everyone, so drop it for a full 10-year estimate.
+- Use one share class per company (GOOG *or* GOOGL).
+- Add a broad-market ETF (e.g. VOO) to size a concentrated basket against the market instead of against cash.
 
 | Flag | Default | Purpose |
 |---|---|---|
@@ -46,7 +53,8 @@ Writes two extra files next to the main CSV: `kelly_portfolio_YYYY-MM-DD.csv` (w
 - **Expected return**: CAPM, `Rf + beta * (MARKET_RETURN - Rf)`
 - **Variance**: 10y monthly returns, annualized x12; requires 60+ months
 - **Standalone Kelly**: `(E[R] - Rf) / variance`, plus 1/2, 1/4, 1/8 fractions
-- **Portfolio Kelly**: maximizes `w'(mu - Rf) - (1/2c) * w'Σw` subject to `0 <= w_i <= max_weight`, `sum(w) <= max_leverage`, solved separately for each fraction `c`. Σ is the shrunk, annualized covariance over the months all basket names share. Uninvested weight is cash.
+- **Portfolio Kelly**: maximizes `w'(mu - Rf) - (1/2c) * w'Σw` subject to `0 <= w_i <= max_weight`, `sum(w) <= max_leverage`, solved separately for each fraction `c`. Σ is the shrunk, annualized covariance over the months all basket names share. Uninvested weight is cash, assumed to earn Rf.
+- **Cash** = 1 − Σw. The optimizer stops adding to a name once its marginal excess return no longer covers the marginal variance it adds, given current holdings. With no cap binding, `w = c · Σ⁻¹(mu − Rf)`, so weights scale linearly with `c` and cash grows as the fraction shrinks. Full Kelly often hits `--max-leverage` and shows 0% cash.
 
 Update `MARKET_RETURN` once a year (link in the script).
 
@@ -88,10 +96,16 @@ One row per basket name plus a `CASH` row. Each weight column sums to 1.
 ## Output: `kelly_portfolio_summary_YYYY-MM-DD.csv`
 One row per Kelly fraction: `invested`, `cash`, `holdings`, `expected_return`, `volatility`, `sharpe`, `expected_growth_rate` (≈ return − variance/2), `months_used`, `solver_ok`.
 
+## Operational notes
+- **FRED timeouts** are common from scripts (likely bot protection); the run falls back to Yahoo `^TNX`, which is the same 10Y yield. Not an error.
+- **Locked output files**: if a CSV is open in Excel, the script writes a timestamped copy (`..._HHMMSS.csv`) instead of failing.
+- **Same-day reruns** overwrite that day's files unless they're locked.
+
 ## Caveats
 - Standalone Kelly sizes each stock **in isolation**; that column won't sum to 100%. Use portfolio Kelly to size a basket.
 - Under CAPM, Kelly reduces to `beta * MRP / variance`. Rankings reflect risk structure, not stock-specific alpha.
 - `cagr_gap` is backward-looking. A large positive gap can mean a great business or a one-time re-rating.
 - Extras (e.g. TSM, ASML ADRs) are priced in USD, so FX moves are baked into their returns. Beta is still measured against the S&P 500.
 - Full Kelly is aggressive; half or quarter is the common practical choice.
+- The covariance window reflects recent history only (≤10 years, often less for young names); a basket that thrived in one regime will look better than it would over a full cycle.
 - Not financial advice.
