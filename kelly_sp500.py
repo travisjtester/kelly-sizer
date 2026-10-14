@@ -105,7 +105,7 @@ def get_sp500_constituents() -> pd.DataFrame:
 def get_risk_free_rate() -> tuple[float, str]:
     """10-Year Treasury yield as a decimal, plus the source used."""
     try:
-        r = requests.get(FRED_URL, headers=UA, timeout=20)
+        r = requests.get(FRED_URL, headers=UA, timeout=8)
         r.raise_for_status()
         s = pd.read_csv(io.StringIO(r.text)).iloc[:, 1]
         s = pd.to_numeric(s, errors="coerce").dropna()
@@ -241,11 +241,18 @@ def portfolio_kelly(prices: pd.DataFrame, results: pd.DataFrame,
     from scipy.optimize import minimize
 
     ok = results.set_index("ticker")
-    basket = [t for t in basket if t in ok.index and ok.at[t, "status"] == "ok"]
+    dropped = [t for t in basket
+               if t not in ok.index or ok.at[t, "status"] != "ok"]
+    for t in dropped:
+        reason = ok.at[t, "status"] if t in ok.index else "not found"
+        log(f"Portfolio: dropping {t} ({reason})")
+    basket = [t for t in basket if t not in dropped]
     if len(basket) < 2:
         raise ValueError("Portfolio needs at least 2 tickers with valid data.")
 
     rets = prices[basket].pct_change(fill_method=None).dropna()
+    shortest = prices[basket].notna().sum().idxmin()
+    log(f"Portfolio: {len(rets)} overlapping months (limited by {shortest})")
     if len(rets) < MIN_MONTHS:
         raise ValueError(f"Only {len(rets)} months of overlapping history "
                          f"across the basket (need {MIN_MONTHS}).")
