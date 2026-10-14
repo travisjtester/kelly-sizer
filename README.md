@@ -41,6 +41,21 @@ Writes two extra files next to the main CSV: `kelly_portfolio_YYYY-MM-DD.csv` (w
 | `--max-leverage` | 1.0 | Max total invested; >1 allows margin |
 | `--shrink` | 0.20 | Covariance shrinkage toward diagonal (0 = raw sample) |
 
+## Phone app (Streamlit)
+`app.py` is a mobile-friendly front end: pick up to 15 tickers, choose a Kelly fraction and a dollar amount, and get the allocation table plus portfolio stats.
+
+```bash
+streamlit run app.py          # local: opens http://localhost:8501
+```
+
+**Deploy (free, Streamlit Community Cloud)**
+1. Push this repo to GitHub.
+2. Go to share.streamlit.io → **Create app** → pick the repo, branch, and `app.py`.
+3. In app settings, restrict viewers to your email if you want it private.
+4. On iPhone: open the URL in Safari → Share → **Add to Home Screen**.
+
+Prices are cached 12h per basket, the risk-free rate 6h, and the constituent list 24h, so repeat taps are instant and Yahoo isn't hammered.
+
 ## Method
 | Input | Source | Fallback |
 |---|---|---|
@@ -99,6 +114,7 @@ One row per Kelly fraction: `invested`, `cash`, `holdings`, `expected_return`, `
 ## Operational notes
 - **FRED timeouts** are common from scripts (likely bot protection); the run falls back to Yahoo `^TNX`, which is the same 10Y yield. Not an error.
 - **Locked output files**: if a CSV is open in Excel, the script writes a timestamped copy (`..._HHMMSS.csv`) instead of failing.
+- **Yahoo on cloud hosts**: shared cloud IPs get rate-limited more than home IPs. If the hosted app starts returning no data, self-host it on a home machine/NAS instead.
 - **Same-day reruns** overwrite that day's files unless they're locked.
 
 ## Caveats
