@@ -7,6 +7,8 @@ Deploy:        Streamlit Community Cloud -> point at this repo, main file app.py
 
 from __future__ import annotations
 
+import altair as alt
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -16,6 +18,13 @@ st.set_page_config(page_title="Kelly Sizer", page_icon="📐", layout="centered"
 
 FRACTIONS = {"Full": "full", "Half": "half", "Quarter": "quarter", "Eighth": "eighth"}
 DEFAULT_TICKERS = ["NVDA", "ASML", "AVGO", "MSFT", "VOO"]
+
+# Backtest chart
+TR_BENCH = "^SP500TR"     # S&P 500 with dividends reinvested (from 1988)
+CASH_PROXY = "^IRX"       # 13-week T-bill yield, annual %
+PORT, BENCH = "Your portfolio", "S&P 500"
+TEAL = "#379A8B"          # also primaryColor in .streamlit/config.toml
+ORANGE = "#eb6834"        # checked against TEAL for colorblind separation
 
 
 # ------------------------------------------------------------- cached data ---
@@ -35,6 +44,106 @@ def sp500_list() -> pd.DataFrame:
 @st.cache_data(ttl=12 * 3600, show_spinner=False)
 def prices_for(tickers: tuple[str, ...]) -> pd.DataFrame:
     return ks.download_monthly_closes(list(tickers) + [ks.BENCHMARK], ks.VARIANCE_YEARS)
+
+
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def full_history(tickers: tuple[str, ...]) -> pd.DataFrame:
+    """Monthly closes over each ticker's full history, for the backtest.
+    Raises on failure so Streamlit doesn't cache an empty result."""
+    import yfinance as yf
+
+    raw = yf.download(list(tickers) + [TR_BENCH, ks.BENCHMARK, CASH_PROXY],
+                      period="max", interval="1mo", auto_adjust=True,
+                      group_by="column", threads=True, progress=False)
+    close = raw["Close"].dropna(how="all")
+    if close.empty:
+        raise RuntimeError("no price history returned")
+    this_month = pd.Timestamp.today().to_period("M").to_timestamp()
+    return close[close.index < this_month]  # drop the partial current month
+
+
+def backtest(hist: pd.DataFrame, held: pd.Series, rf: float) -> pd.DataFrame:
+    """Growth of $1 in today's weights (rebalanced monthly) vs the S&P 500,
+    from the first month every held name and the benchmark have data."""
+    has = lambda c: c in hist.columns and hist[c].notna().any()
+    missing = [t for t in held.index if not has(t)]
+    if missing:
+        raise RuntimeError(f"no history for {', '.join(missing)}")
+    bench = TR_BENCH if has(TR_BENCH) else ks.BENCHMARK
+
+    rets = hist[list(held.index) + [bench]].pct_change(fill_method=None)
+    if has(CASH_PROXY):  # last month's T-bill yield, earned this month
+        cash = (hist[CASH_PROXY].ffill() / 100 / 12).shift(1)
+    else:
+        cash = pd.Series(rf / 12, index=hist.index)
+    df = pd.concat([rets, cash.rename("_cash")], axis=1).dropna()
+
+    port = df[held.index] @ held.values + df["_cash"] * (1 - held.sum())
+    growth = (1 + pd.DataFrame({PORT: port, BENCH: df[bench]})).cumprod()
+    start = hist.index[hist.index.get_loc(df.index[0]) - 1]
+    return pd.concat([pd.DataFrame({PORT: [1.0], BENCH: [1.0]}, index=[start]), growth])
+
+
+def cagr(s: pd.Series) -> float:
+    return (s.iloc[-1] / s.iloc[0]) ** (12 / (len(s) - 1)) - 1
+
+
+def max_drawdown(s: pd.Series) -> float:
+    return (s / s.cummax() - 1).min()
+
+
+def doubling_ticks(start: float, lo: float, hi: float) -> list[float]:
+    """Gridlines at each doubling of the starting value, evenly spaced on a log axis."""
+    ks_ = range(int(np.floor(np.log2(lo / start))), int(np.ceil(np.log2(hi / start))) + 1)
+    ticks = [start * 2 ** k for k in ks_ if lo <= start * 2 ** k <= hi]
+    return ticks if len(ticks) >= 3 else alt.Undefined  # narrow range: let Vega pick
+
+
+def growth_chart(values: pd.DataFrame, log: bool = False) -> alt.Chart:
+    """Two lines (linear or log y), hover crosshair with both values, end labels."""
+    ink = "#FAFAFA" if st.context.theme.type == "dark" else "#31333F"
+    long = values.rename_axis("date").reset_index().melt(
+        "date", var_name="series", value_name="value")
+    color = alt.Color("series:N", title=None, legend=alt.Legend(orient="top"),
+                      scale=alt.Scale(domain=[PORT, BENCH], range=[TEAL, ORANGE]))
+    x = alt.X("date:T", title=None)
+    if log:
+        lo, hi = values.min().min(), values.max().max()
+        scale = alt.Scale(type="log", nice=False, domain=[lo / 1.05, hi * 1.05])
+        axis = alt.Axis(format="$.2~s", values=doubling_ticks(values.iloc[0, 0], lo, hi))
+    else:
+        scale = alt.Scale(zero=True)
+        axis = alt.Axis(format="$.2~s", tickCount=5)
+    y = alt.Y("value:Q", title=None, scale=scale, axis=axis)
+
+    lines = alt.Chart(long).mark_line(strokeWidth=2).encode(x, y, color)
+
+    hover = alt.selection_point(nearest=True, on="pointerover", fields=["date"],
+                                empty=False, clear="pointerout")
+    rule = (
+        alt.Chart(long)
+        .transform_pivot("series", value="value", groupby=["date"])
+        .mark_rule(color="#8a8986", strokeWidth=12)  # wide, invisible hit target
+        .encode(
+            x,
+            opacity=alt.condition(hover, alt.value(0.25), alt.value(0)),
+            tooltip=[alt.Tooltip("date:T", title="Month", format="%b %Y"),
+                     alt.Tooltip(field=PORT, type="quantitative", format="$,.0f"),
+                     alt.Tooltip(field=BENCH, type="quantitative", format="$,.0f")],
+        )
+        .add_params(hover)
+    )
+    dots = (alt.Chart(long).mark_point(filled=True, size=70)
+            .encode(x, y, color, opacity=alt.condition(hover, alt.value(1), alt.value(0))))
+
+    last = long[long["date"] == long["date"].max()].copy()
+    last["dy"] = [-12 if v == last["value"].max() else 14 for v in last["value"]]
+    labels = alt.layer(*[
+        alt.Chart(last[last["series"] == s]).mark_text(
+            align="right", dy=row_dy, fontSize=12, color=ink).encode(x, y, text="series:N")
+        for s, row_dy in zip(last["series"], last["dy"])
+    ])
+    return alt.layer(lines, rule, dots, labels).properties(height=320)
 
 
 def capture_logs():
@@ -72,6 +181,8 @@ with st.form("inputs"):
         shrink = st.slider("Covariance shrinkage", 0.0, 1.0, ks.COV_SHRINK, 0.05)
         mkt_ret = st.number_input("Long-run market return", 0.0, 0.30,
                                   ks.MARKET_RETURN, 0.005, format="%.4f")
+        log_scale = st.checkbox("Log scale on backtest chart",
+                                help="Each gridline is a doubling. Better for long histories.")
 
     run = st.form_submit_button("Size it", type="primary", width="stretch")
 
@@ -170,5 +281,67 @@ st.caption(
 )
 if not bool(s["solver_ok"]):
     st.warning("Optimizer didn't fully converge for this fraction; treat as approximate.")
-st.caption("CAPM expected returns; sizes reflect risk and correlation, not conviction. "
-           "Not financial advice.")
+
+# ---- backtest chart
+st.subheader("Backtest vs S&P 500")
+held = weights.set_index("ticker")[wcol].drop("CASH")
+held = held[held > 0]
+growth = None
+if not held.empty:
+    try:
+        with st.spinner("Pulling full price history…"):
+            growth = backtest(full_history(tuple(sorted(held.index))), held, rf)
+    except Exception:
+        pass
+if growth is None or len(growth) < 13:
+    st.caption("Price history for the backtest isn't available right now.")
+else:
+    start_value = amount or 10_000
+    values = growth * start_value
+    st.altair_chart(growth_chart(values, log=log_scale), width="stretch")
+    p, b = values[PORT], values[BENCH]
+    st.caption(
+        f"Growth of ${start_value:,.0f} from {values.index[0]:%b %Y}, rebalanced monthly "
+        f"to the {fraction_label.lower()} Kelly weights above"
+        f"{' (log scale: each gridline is a doubling)' if log_scale else ''}. "
+        f"Portfolio {cagr(p):.1%}/yr, worst drop {max_drawdown(p):.0%} · "
+        f"S&P 500 {cagr(b):.1%}/yr, worst drop {max_drawdown(b):.0%}."
+    )
+    with st.expander("Backtest data"):
+        yearly = values.resample("YE").last()
+        yearly.index = yearly.index.year
+        st.dataframe(yearly.rename_axis("Year").map(lambda x: f"${x:,.0f}"),
+                     width="stretch")
+
+# ---- methodology
+st.subheader("Methodology")
+st.markdown(
+    f"""
+The **Kelly criterion** sizes each bet to maximize long-run compound growth. Bet too
+little and you leave growth on the table; bet too much and volatility drags growth
+down, eventually below zero. For a single stock the optimal fraction is
+*(expected return − risk-free rate) ÷ variance*, shown as **Solo Kelly** above. Holding
+several stocks at once, correlations matter: two names that move together are closer
+to one big bet, so the joint weights end up smaller than the solo figures.
+
+Full Kelly is the growth-maximizing size, but it's a rough ride and very sensitive to
+errors in the return estimates. **Half Kelly** keeps about 75% of the growth with half
+the volatility, which is why fractions are the usual choice.
+
+- **Expected returns** come from CAPM: the 10-year Treasury yield plus each stock's
+  beta (5 years of monthly returns vs. the S&P 500) times the market risk premium
+  ({mkt_ret:.1%} long-run market return minus the risk-free rate).
+- **Risk** is the covariance of monthly returns over up to 10 years of shared history,
+  shrunk {shrink:.0%} toward its diagonal to damp estimation noise.
+- **Weights** maximize the basket's expected log growth (multi-asset Kelly), capped at
+  {max_weight:.0%} per name and {max_lev:.0%} invested in total. Fractional Kelly is solved
+  as higher risk aversion, not by scaling the full-Kelly weights. Anything not invested
+  sits in cash.
+- **The backtest** applies today's weights to each month's actual returns, with cash
+  earning the 3-month T-bill rate and the S&P 500 including dividends. The weights were
+  chosen with hindsight on the same data, and it ignores costs and taxes, so treat it
+  as optimistic.
+
+Sizes reflect risk and correlation, not conviction. Not financial advice.
+"""
+)
