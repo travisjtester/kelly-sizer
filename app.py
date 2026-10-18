@@ -1,6 +1,6 @@
 """
-Kelly Sizer — phone-friendly Streamlit front end for kelly_sp500.py, after
-Concentrated Investing (Benello, van Biema & Carlisle), chapters 3-4.
+Kelly Sizer, phone app. Same engine and workflow as the command line
+(kelly.py), after Concentrated Investing (Benello, van Biema & Carlisle), ch. 3-4.
 
 Run locally:   streamlit run app.py
 Deploy:        Streamlit Community Cloud -> point at this repo, main file app.py
@@ -15,14 +15,14 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 
-import kelly_sp500 as ks
+import kelly as ks
 
 st.set_page_config(page_title="Kelly Sizer", page_icon="📐", layout="centered")
 
 
 @st.cache_resource
 def _engine_loaded() -> dict:
-    """Process-wide record of which kelly_sp500.py version is in memory."""
+    """Process-wide record of which kelly.py version is in memory."""
     return {"mtime": os.path.getmtime(ks.__file__)}
 
 
@@ -30,7 +30,7 @@ def _engine_loaded() -> dict:
 # After a merge, Cloud would pair the new app with the old engine in memory,
 # so reload it when the file on disk is newer than what's loaded.
 _loaded, _mtime = _engine_loaded(), os.path.getmtime(ks.__file__)
-if _mtime != _loaded["mtime"] or not hasattr(ks, "journal_report"):
+if _mtime != _loaded["mtime"] or not hasattr(ks, "size_basket"):
     ks = importlib.reload(ks)
     _loaded["mtime"] = _mtime
 
@@ -63,13 +63,6 @@ def latest_for(tickers: tuple[str, ...]) -> dict[str, float]:
     return ks.download_latest_prices(list(tickers))
 
 
-def capture_logs():
-    """Collect the engine's console messages so we can show them in the UI."""
-    msgs: list[str] = []
-    ks.log = msgs.append
-    return msgs
-
-
 def _pct(x):
     return None if x is None or pd.isna(x) else round(float(x) * 100, 4)
 
@@ -93,7 +86,6 @@ def _init_journal() -> pd.DataFrame:
 
 meta = sp500_list()
 options = sorted(set(meta["ticker"]) | set(DEFAULT_TICKERS))
-logs = capture_logs()
 
 if "views" not in st.session_state:
     st.session_state.views = _init_views()
@@ -209,10 +201,11 @@ with st.expander("Settings"):
     horizon = st.slider("Holding horizon (years)", 1.0, 10.0, ks.DEFAULT_HORIZON, 0.5,
                         help="Buy and hold for this long: how long your theses take to "
                              "play out. Applies to every name.")
-    max_weight = st.slider("Max per name", 0.05, 1.0, ks.PORTFOLIO_MAX_WEIGHT, 0.05,
-                           format="%.2f",
-                           help="Buffett: '25 percent for the largest'; "
-                                "40% for an American Express-level idea.")
+    max_weight = st.slider("Max per name", 0.05, ks.BOOK_MAX_WEIGHT,
+                           ks.PORTFOLIO_MAX_WEIGHT, 0.05, format="%.2f",
+                           help="Buffett: '25 percent for the largest'. 40% is the "
+                                "ceiling: his biggest position ever, American Express "
+                                "after the salad-oil scandal.")
     max_lev = st.slider("Max invested (1.0 = no margin)", 0.5, 2.0,
                         ks.PORTFOLIO_MAX_LEVERAGE, 0.1)
     shrink = st.slider("Correlation shrinkage", 0.0, 1.0, ks.COV_SHRINK, 0.05,
@@ -242,110 +235,63 @@ else:
         if prices.empty or ks.BENCHMARK not in prices.columns:
             st.error("No price data came back from Yahoo. Try again in a minute.")
         else:
-            results = ks.compute_kelly(prices, rf, mkt_ret, views=views,
-                                       horizon=horizon, prices_now=prices_now)
-            missing = [t for t in tickers if t not in prices.columns]
-            if missing:
-                results = pd.concat([results, pd.DataFrame({"ticker": missing,
-                                                            "status": "no price data"})])
-            results = meta.merge(results, on="ticker", how="right")
             try:
-                weights, summary = ks.portfolio_kelly(prices, results, tickers, rf,
-                                                      max_weight=max_weight,
-                                                      max_leverage=max_lev,
-                                                      shrink=shrink, horizon=horizon)
+                with ks.captured_log() as logs:
+                    results, weights, summary = ks.size_basket(
+                        prices, tickers, rf, views=views, prices_now=prices_now,
+                        meta=meta, market_return=mkt_ret, horizon=horizon,
+                        max_weight=max_weight, max_leverage=max_lev, shrink=shrink)
                 results_ready = True
             except ValueError as e:
                 st.error(str(e))
 
 if results_ready:
     frac = FRACTIONS[fraction_label]
-    wcol = f"weight_{frac}_kelly"
-    s = summary.set_index("kelly_fraction").loc[frac]
-    n_views, hz = int(s["views_used"]), f"{s['horizon_years']:g}y"
+    n_views = int(summary["views_used"].iloc[0])
+    (st.success if n_views else st.info)(ks.basket_message(summary))
 
-    if n_views:
-        st.success(f"Sized on your research for {n_views} of {int(s['basket_size'])} "
-                   f"names over a {s['horizon_years']:g}-year hold. The rest use CAPM.")
-    else:
-        st.info("No views yet, so every name uses CAPM, which assumes no edge and sizes "
-                "by risk alone. Add your research to size on conviction.")
+    # ---- headline (shared with the CLI): permanent-loss risk first
+    stats = ks.headline(summary, frac)
+    for row in (stats[:3], stats[3:]):
+        for col, (label, value, why) in zip(st.columns(3), row):
+            col.metric(label, value, help=why or None)
 
-    # ---- headline: the book defines risk as permanent loss of capital
-    loss_help = ("Uses your permanent-loss inputs; CAPM names use price history"
-                 if n_views else "CAPM names: estimated from price history")
-    m1, m2, m3 = st.columns(3)
-    m1.metric(f"Chance of loss ({hz})", f"{s['prob_loss']:.0%}",
-              help=f"Chance the basket ends the horizon below where it started. {loss_help}.")
-    m2.metric(f"Worst case, 1-in-20 ({hz})", f"{s['worst_5pct']:.0%}",
-              help="5th-percentile outcome over the horizon.")
-    m3.metric("Exp. growth", f"{s['expected_growth_rate']:.1%}/yr",
-              help="Expected compound growth, what Kelly maximizes.")
-    m4, m5, m6 = st.columns(3)
-    m4.metric("Invested", f"{s['invested']:.0%}")
-    m5.metric("Cash", f"{s['cash']:.0%}")
-    m6.metric("Price swings", f"{s['volatility']:.0%}/yr",
-              help="How bumpy the ride is (annualized). Not risk in the book's sense, "
-                   "but it's what you have to sit through. It's why fractional Kelly exists.")
-
-    # ---- allocation table
-    cols = ["ticker", wcol, "edge_source", "margin_of_safety", "standalone_full_kelly",
-            "annual_volatility"]
-    tbl = weights[[c for c in cols if c in weights.columns]].copy()
-    tbl = tbl.rename(columns={wcol: "weight"})
-    tbl["dollars"] = tbl["weight"] * amount
-    tbl = pd.concat([tbl[tbl.ticker != "CASH"].sort_values("weight", ascending=False),
-                     tbl[tbl.ticker == "CASH"]])
-    for c in ["weight", "standalone_full_kelly", "annual_volatility", "margin_of_safety"]:
+    # ---- allocation table (shared with the CLI)
+    tbl = ks.allocation_table(weights, frac, amount)
+    for c in ["weight", "margin_of_safety", "solo_kelly", "swing"]:
         if c in tbl.columns:
             tbl[c] = tbl[c] * 100
-    show = ["ticker", "weight", "dollars", "edge_source", "standalone_full_kelly",
-            "annual_volatility"]
-    if "margin_of_safety" in tbl.columns and tbl["margin_of_safety"].notna().any():
-        show.insert(4, "margin_of_safety")
-
     st.subheader(f"{fraction_label} Kelly allocation")
     st.dataframe(
-        tbl[show], hide_index=True, width="stretch",
+        tbl, hide_index=True, width="stretch",
         column_config={
             "ticker": st.column_config.TextColumn("Ticker", pinned=True),
             "weight": st.column_config.ProgressColumn("Weight", format="%.1f%%",
                                                       min_value=0, max_value=100),
             "dollars": st.column_config.NumberColumn("$", format="$%,.0f"),
-            "edge_source": st.column_config.TextColumn("Edge"),
+            "edge": st.column_config.TextColumn("Edge"),
             "margin_of_safety": st.column_config.NumberColumn("MoS", format="%.0f%%",
                                                               help="Margin of safety"),
-            "standalone_full_kelly": st.column_config.NumberColumn(
+            "solo_kelly": st.column_config.NumberColumn(
                 "Solo Kelly", format="%.0f%%",
                 help="This name's Kelly bet on its own: a ceiling, not a target"),
-            "annual_volatility": st.column_config.NumberColumn(
+            "swing": st.column_config.NumberColumn(
                 "Swing", format="%.0f%%",
                 help="Annual price volatility: how bumpy, not how risky"),
         },
     )
 
     with st.expander("Compare all Kelly fractions"):
-        wide = weights[["ticker"] + [f"weight_{f}_kelly" for f in FRACTIONS.values()]].copy()
-        wide.columns = ["Ticker"] + list(FRACTIONS)
-        st.dataframe(wide.set_index("Ticker").map(lambda x: f"{x:.1%}"), width="stretch")
-        st.dataframe(
-            summary.set_index("kelly_fraction")[
-                ["prob_loss", "worst_5pct", "expected_growth_rate", "invested",
-                 "expected_return", "volatility"]
-            ].rename(columns={
-                "prob_loss": f"Chance of loss ({hz})", "worst_5pct": f"Worst 1-in-20 ({hz})",
-                "expected_growth_rate": "Exp. growth/yr", "invested": "Invested",
-                "expected_return": "Exp. return/yr", "volatility": "Price swings/yr",
-            }).rename_axis("Kelly").map(lambda x: f"{x:.1%}"),
-            width="stretch",
-        )
+        wide, fstats = ks.fractions_table(weights, summary)
+        st.dataframe(wide.map(lambda x: f"{x:.1%}"), width="stretch")
+        st.dataframe(fstats.map(lambda x: f"{x:.1%}"), width="stretch")
 
-    notes = [m.removeprefix("Portfolio: ") for m in logs if m.startswith("Portfolio:")]
-    notes += [m.removeprefix("Views: ") for m in logs if m.startswith("Views:")]
-    st.caption(f"Risk-free {rf:.2%} ({rf_src}) · {int(s['months_used'])} months of "
-               f"price history for correlations" + (f" · {'; '.join(notes)}" if notes else ""))
-    if not bool(s["solver_ok"]):
-        st.warning("Optimizer didn't fully converge for this fraction; treat as approximate.")
+    st.caption(ks.run_note(summary, rf, rf_src, logs))
+    if not summary["solver_ok"].all():
+        st.warning("Optimizer didn't fully converge for some fractions; treat as approximate.")
+    st.download_button("Save these results (CSV)", weights.to_csv(index=False),
+                       f"kelly_portfolio_{date.today():%Y-%m-%d}.csv", "text/csv",
+                       width="stretch")
 
 # ---- conviction journal
 st.divider()
