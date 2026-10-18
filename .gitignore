@@ -7,3 +7,4 @@ venv/
 
 # keep the example views file
 !views.example.csv
+.pytest_cache/

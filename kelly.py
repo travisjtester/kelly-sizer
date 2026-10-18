@@ -1,6 +1,9 @@
 """
-Kelly Criterion position sizing, after Concentrated Investing (Benello,
-van Biema & Carlisle, Wiley 2016), chapters 3-4.
+Kelly Sizer engine and command line: Kelly position sizing after
+Concentrated Investing (Benello, van Biema & Carlisle, Wiley 2016), ch. 3-4.
+The phone app (app.py) runs the same engine.
+
+    python kelly.py NVDA ASML KO MSFT VOO      (see --help)
 
 Pipeline
   1. Constituents  : Wikipedia (browser UA) -> GitHub datasets CSV fallback
@@ -17,6 +20,7 @@ Pipeline
                      correlated scenarios (Thorp's "joint properties" rule)
   7. Journal       : dated views + recorded outcomes -> calibration of your
                      probabilities
+  8. Screen        : opt-in no-edge baseline for the whole S&P 500 (--screen)
 
 Kelly: maximize E[log wealth]. For one win/lose bet this is the book's
 (bp - q) / b; here it is solved for any outcome mix and for the basket.
@@ -28,6 +32,7 @@ import argparse
 import io
 import sys
 import time
+from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 
@@ -196,28 +201,29 @@ def download_latest_prices(tickers: list[str]) -> dict[str, float]:
 VIEW_COLS = ["p_bear", "bear", "p_base", "base", "bull", "value"]
 LEGACY_VIEW_COLS = ["p_win", "upside", "downside"]
 
-# A column is read as percents if any plain number in it exceeds this
-# (probabilities and bear loss: 1; returns can legitimately exceed 100%).
-_PCT_THRESHOLD = {"p_bear": 1.0, "p_base": 1.0, "p_bull": 1.0, "bear": 1.0,
-                  "base": 10.0, "bull": 10.0,
-                  "p_win": 1.0, "upside": 10.0, "downside": 1.0}
+UNIT_COLS = ["p_bear", "p_base", "p_bull", "bear", "p_win", "downside"]   # always <= 1 as decimals
 
 
-def _column_to_fraction(col: pd.Series, name: str) -> pd.Series:
-    """
-    Parse one views column. A '%' sign always means percent. Otherwise the
-    column is read consistently: all percents if any value exceeds the
-    threshold for that column (60 -> 0.60), else all decimals (0.6 -> 0.60).
-    """
+def _file_uses_percents(d: pd.DataFrame) -> bool:
+    """A views file uses one set of units. The odds and loss columns can't
+    exceed 1 as decimals, so any plain value above 1 there means the whole
+    file is in percents (40 = 40%); otherwise it's decimals (0.4 = 40%)."""
+    for c in UNIT_COLS:
+        if c in d.columns:
+            txt = d[c].astype(str).str.strip()
+            num = pd.to_numeric(txt[~txt.str.endswith("%")], errors="coerce").dropna()
+            if (num.abs() > 1).any():
+                return True
+    return False
+
+
+def _column_to_fraction(col: pd.Series, as_pct: bool) -> pd.Series:
+    """Parse one column. A '%' sign always means percent; plain numbers follow
+    the file's units."""
     txt = col.astype(str).str.strip().replace({"nan": "", "None": "", "<NA>": ""})
     has_pct = txt.str.endswith("%")
     num = pd.to_numeric(txt.str.rstrip("%"), errors="coerce")
-    plain = num[~has_pct].dropna()
-    as_pct = bool((plain.abs() > _PCT_THRESHOLD[name]).any())
-    out = num.where(~has_pct, num / 100)
-    if as_pct:
-        out = out.where(has_pct, num / 100)
-    return out
+    return num / 100 if as_pct else num.where(~has_pct, num / 100)
 
 
 def normalize_views(df: pd.DataFrame | None) -> pd.DataFrame:
@@ -242,17 +248,20 @@ def normalize_views(df: pd.DataFrame | None) -> pd.DataFrame:
     legacy = set(LEGACY_VIEW_COLS) <= set(d.columns) and "p_bear" not in d.columns
     if not legacy and not {"p_bear", "bear"} <= set(d.columns):
         raise ValueError("Views need p_bear and bear (or the older p_win, upside, downside)")
+    as_pct = _file_uses_percents(d)
     if legacy:
         for c in LEGACY_VIEW_COLS:
-            d[c] = _column_to_fraction(d[c], c)
+            d[c] = _column_to_fraction(d[c], as_pct)
         d["p_bear"] = 1 - d["p_win"]
         d["bear"] = d["downside"]
         d["bull"] = d["upside"]
     for c in VIEW_COLS:
         if c not in d.columns:
             d[c] = np.nan
+    done = {"p_bear", "bear", "bull"} if legacy else set()    # already converted above
     for c in ["p_bear", "bear", "p_base", "base", "bull"]:
-        d[c] = _column_to_fraction(d[c], c)
+        if c not in done:
+            d[c] = _column_to_fraction(d[c], as_pct)
     d["value"] = pd.to_numeric(d["value"].astype(str).str.replace(r"[$,]", "", regex=True),
                                errors="coerce")
     d["bear"] = d["bear"].abs()
@@ -272,10 +281,10 @@ def normalize_views(df: pd.DataFrame | None) -> pd.DataFrame:
             "Invalid views for " + ", ".join(bad["ticker"]) + ". Need 0 < bear odds < 1, "
             "0 < bear loss <= 100%, bear + base odds < 100%, a base return when base "
             "odds are set, and a positive bull return or value.")
-    tiny = d[d.bull.notna() & (d.bull < 0.02)]
-    if not tiny.empty:
-        log("Views: bull return under 2% for " + ", ".join(tiny["ticker"])
-            + " - check units (use 1.5 or 150 for +150%)")
+    odd = d[d.bull.notna() & ((d.bull < 0.02) | (d.bull > 10))]
+    if not odd.empty:
+        log("Views: check units for " + ", ".join(odd["ticker"]) + " (bull under +2% or "
+            "over +1000%). Use the same units as your odds: 0.4 and 1.5, or 40 and 150")
     if "notes" not in d.columns:
         d["notes"] = ""
     d["notes"] = d["notes"].fillna("")
@@ -726,15 +735,169 @@ def journal_report(journal: pd.DataFrame, prices_now: dict[str, float] | None = 
     return j, summary, calib
 
 
-# ------------------------------------------------------------------ main ---
-def default_output() -> Path:
+# --------------------------------------------------------- one workflow ---
+# The phone app and the command line both run these, so they always show the
+# same numbers, in the same order, with the same words.
+@contextmanager
+def captured_log():
+    """Collect engine messages (dropped names, view notes) instead of printing."""
+    global log
+    msgs: list[str] = []
+    original, log = log, msgs.append
+    try:
+        yield msgs
+    finally:
+        log = original
+
+
+FRACTION_NAMES = {"full": "Full", "half": "Half", "quarter": "Quarter", "eighth": "Eighth"}
+
+
+def size_basket(prices: pd.DataFrame, tickers: list[str], rf: float,
+                views: pd.DataFrame | None = None,
+                prices_now: dict[str, float] | None = None,
+                meta: pd.DataFrame | None = None,
+                market_return: float = MARKET_RETURN,
+                horizon: float = DEFAULT_HORIZON,
+                max_weight: float = PORTFOLIO_MAX_WEIGHT,
+                max_leverage: float = PORTFOLIO_MAX_LEVERAGE,
+                shrink: float = COV_SHRINK,
+                n_scenarios: int = N_SCENARIOS,
+                ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Per-name stats, then joint Kelly weights. Returns (results, weights, summary)."""
+    results = compute_kelly(prices, rf, market_return, views=views,
+                            horizon=horizon, prices_now=prices_now)
+    missing = [t for t in tickers if t not in prices.columns]
+    if missing:
+        results = pd.concat([results, pd.DataFrame({"ticker": missing,
+                                                    "status": "no price data"})])
+    if meta is not None and len(meta):
+        results = meta.merge(results, on="ticker", how="right")
+    weights, summary = portfolio_kelly(prices, results, tickers, rf,
+                                       max_weight=max_weight, max_leverage=max_leverage,
+                                       shrink=shrink, horizon=horizon,
+                                       n_scenarios=n_scenarios)
+    return results, weights, summary
+
+
+def basket_message(summary: pd.DataFrame) -> str:
+    s = summary.iloc[0]
+    n, total, h = int(s["views_used"]), int(s["basket_size"]), s["horizon_years"]
+    if n:
+        return (f"Sized on your research for {n} of {total} names over a {h:g}-year "
+                f"hold. The rest use CAPM.")
+    return ("No views yet, so every name uses CAPM, which assumes no edge and sizes by "
+            "risk alone. Add your research to size on conviction.")
+
+
+def headline(summary: pd.DataFrame, fraction: str) -> list[tuple[str, str, str]]:
+    """(label, value, explanation), in the book's order: permanent-loss risk first."""
+    s = summary.set_index("kelly_fraction").loc[fraction]
+    hz = f"{s['horizon_years']:g}y"
+    return [
+        (f"Chance of loss ({hz})", f"{s['prob_loss']:.0%}",
+         "Chance the basket ends the horizon below where it started"),
+        (f"Worst case, 1-in-20 ({hz})", f"{s['worst_5pct']:.0%}",
+         "5th-percentile outcome over the horizon"),
+        ("Exp. growth", f"{s['expected_growth_rate']:.1%}/yr",
+         "Expected compound growth, what Kelly maximizes"),
+        ("Invested", f"{s['invested']:.0%}", ""),
+        ("Cash", f"{s['cash']:.0%}", "Earns the risk-free rate"),
+        ("Price swings", f"{s['volatility']:.0%}/yr",
+         "How bumpy the ride is. Not risk in the book's sense, but what you sit through"),
+    ]
+
+
+def allocation_table(weights: pd.DataFrame, fraction: str, amount: float) -> pd.DataFrame:
+    """One row per name plus CASH: weight, dollars, edge, margin of safety,
+    solo Kelly, price swings. Fractions are decimals."""
+    w = weights.copy()
+    out = pd.DataFrame({
+        "ticker": w["ticker"],
+        "weight": w[f"weight_{fraction}_kelly"],
+        "dollars": w[f"weight_{fraction}_kelly"] * amount,
+        "edge": w.get("edge_source"),
+        "margin_of_safety": w.get("margin_of_safety"),
+        "solo_kelly": w.get("standalone_full_kelly"),
+        "swing": w.get("annual_volatility"),
+    })
+    names = out[out.ticker != "CASH"].sort_values(["weight", "ticker"], ascending=[False, True])
+    out = pd.concat([names, out[out.ticker == "CASH"]], ignore_index=True)
+    if out["margin_of_safety"].isna().all():
+        out = out.drop(columns="margin_of_safety")
+    return out
+
+
+def fractions_table(weights: pd.DataFrame, summary: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Weights at every fraction, and the headline stats at every fraction."""
+    wide = weights[["ticker"] + [f"weight_{f}_kelly" for f in FRACTIONS]].copy()
+    wide.columns = ["Ticker"] + [FRACTION_NAMES[f] for f in FRACTIONS]
+    hz = f"{summary['horizon_years'].iloc[0]:g}y"
+    stats = (summary.set_index("kelly_fraction")
+             [["prob_loss", "worst_5pct", "expected_growth_rate", "invested",
+               "expected_return", "volatility"]]
+             .rename(index=FRACTION_NAMES, columns={
+                 "prob_loss": f"Chance of loss ({hz})",
+                 "worst_5pct": f"Worst 1-in-20 ({hz})",
+                 "expected_growth_rate": "Exp. growth/yr", "invested": "Invested",
+                 "expected_return": "Exp. return/yr", "volatility": "Price swings/yr"})
+             .rename_axis("Kelly"))
+    return wide.set_index("Ticker"), stats
+
+
+def run_note(summary: pd.DataFrame, rf: float, rf_source: str, logs: list[str]) -> str:
+    notes = [m.split(": ", 1)[1] for m in logs if m.startswith(("Portfolio:", "Views:"))]
+    return (f"Risk-free {rf:.2%} ({rf_source}) · {int(summary['months_used'].iloc[0])} "
+            f"months of price history for correlations"
+            + (f" · {'; '.join(notes)}" if notes else ""))
+
+
+# ---------------------------------------------------------- screen (opt-in) ---
+def screen_sp500(rf: float, market_return: float = MARKET_RETURN,
+                 horizon: float = DEFAULT_HORIZON, views: pd.DataFrame | None = None,
+                 extra: list[str] | None = None, limit: int | None = None) -> pd.DataFrame:
+    """
+    The no-edge baseline: solo Kelly for every S&P 500 name under CAPM (and
+    your views where you have them). CAPM sizes by risk alone, so this ranks
+    risk structure, not opportunities. The book's ideas come from research.
+    """
+    meta = get_sp500_constituents()
+    meta["universe"] = "S&P 500"
+    tickers = meta["ticker"].tolist()[:limit] if limit else meta["ticker"].tolist()
+    views = views if views is not None else normalize_views(None)
+    add = [t for t in dict.fromkeys([_yahoo_symbol(t) for t in (extra or [])]
+                                    + list(views.index)) if t not in tickers]
+    tickers += add
+    non_sp = [t for t in tickers if t not in set(meta["ticker"])]
+    if non_sp:
+        extra_meta = lookup_extra_meta(non_sp)
+        extra_meta["universe"] = "Extra"
+        meta = pd.concat([meta, extra_meta], ignore_index=True)
+    prices = download_monthly_closes(tickers + [BENCHMARK], VARIANCE_YEARS)
+    if prices.empty or BENCHMARK not in prices.columns:
+        raise RuntimeError("no price data returned")
+    prices_now = download_latest_prices(list(views.index)) if len(views) else {}
+    res = compute_kelly(prices, rf, market_return, views=views, horizon=horizon,
+                        prices_now=prices_now)
+    missing = sorted(set(tickers) - set(prices.columns))
+    if missing:
+        res = pd.concat([res, pd.DataFrame({"ticker": missing, "status": "no price data"})])
+    res = meta.merge(res, on="ticker", how="right")
+    res.insert(0, "run_date", date.today().isoformat())
+    res["risk_free_rate"] = rf
+    res["market_return"] = market_return
+    return res.sort_values("full_kelly", ascending=False, na_position="last")
+
+
+# ------------------------------------------------------------------ files ---
+def default_out_dir() -> Path:
     desktop = Path.home() / "Desktop"
-    folder = desktop if desktop.exists() else Path.cwd()
-    return folder / f"kelly_sp500_{date.today():%Y-%m-%d}.csv"
+    return desktop if desktop.exists() else Path.cwd()
 
 
 def safe_to_csv(df: pd.DataFrame, path: Path) -> Path:
     """Write CSV; if the file is locked (open in Excel), use a timestamped name."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     try:
         df.to_csv(path, index=False)
         return path
@@ -762,173 +925,195 @@ def lookup_extra_meta(tickers: list[str]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# -------------------------------------------------------------------- CLI ---
+def _fmt_table(df: pd.DataFrame, pct: list[str], money: list[str] = ()) -> str:
+    f = {c: (lambda x: "" if pd.isna(x) else f"{x:.2f}") for c in ["beta"] if c in df.columns}
+    f.update({c: (lambda x: "" if pd.isna(x) else f"{x:.1%}") for c in pct if c in df.columns})
+    f.update({c: (lambda x: "" if pd.isna(x) else f"${x:,.0f}") for c in money if c in df.columns})
+    return df.to_string(index=False, formatters=f, na_rep="")
+
+
+def print_journal(journal: pd.DataFrame) -> None:
+    now = download_latest_prices(sorted(set(journal["ticker"])))
+    entries, s, calib = journal_report(journal, now)
+    print(f"\nConviction journal: {s['entries']} calls · {s['resolved']} resolved · "
+          f"{s['due']} due for an outcome · {s['open']} open")
+    if s["resolved"]:
+        print(f"  {s['verdict']}")
+        print(f"  Brier score {s['brier']:.2f} (0 = perfect) · on average you gave "
+              f"{s['avg_prob_of_actual']:.0%} odds to what actually happened")
+        print("  " + _fmt_table(calib.rename(columns={
+            "bucket": "Bull odds you gave", "calls": "Calls",
+            "predicted_bull": "Predicted", "actual_bull": "Came true"}),
+            pct=["Predicted", "Came true"]).replace("\n", "\n  "))
+    due = entries[entries["status"] == "due"]
+    if len(due):
+        print("  Due: fill bear/base/bull in the outcome column for "
+              + ", ".join(f"{t} (logged {d})" for t, d in zip(due["ticker"], due["date"])))
+
+
+EXAMPLES = """
+examples:
+  python kelly.py NVDA ASML KO MSFT VOO                 size this basket (half Kelly, $10,000)
+  python kelly.py NVDA ASML KO --fraction quarter --amount 25000
+  python kelly.py                                       size the names in views.csv
+  python kelly.py NVDA ASML KO --log                    ...and log today's views to journal.csv
+  python kelly.py --report                              conviction journal only
+  python kelly.py --screen --extra TSM ASML             S&P 500 no-edge baseline to CSV
+
+views.csv and journal.csv in the current folder are used automatically,
+the same files the phone app saves and loads.
+"""
+
+
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Kelly Criterion sizing after Concentrated Investing")
-    p.add_argument("--tickers", nargs="+",
-                   help="Run ONLY these tickers instead of the full index")
-    p.add_argument("--extra", nargs="+", default=[],
-                   help="Add non-S&P tickers on top of the index (e.g. TSM ASML)")
-    p.add_argument("--limit", type=int,
-                   help="Only process the first N constituents (quick test)")
-    p.add_argument("--market-return", type=float, default=MARKET_RETURN,
-                   help=f"Long-run market return (default {MARKET_RETURN})")
-    p.add_argument("--out", type=Path, default=None, help="Output CSV path")
+    p = argparse.ArgumentParser(
+        prog="kelly.py",
+        description="Kelly Sizer: Kelly position sizing after Concentrated Investing "
+                    "(Benello, van Biema & Carlisle).",
+        epilog=EXAMPLES, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("tickers", nargs="*", help="Your basket, e.g. NVDA ASML KO MSFT VOO")
+    p.add_argument("--portfolio", nargs="+", help=argparse.SUPPRESS)  # old spelling
 
-    g = p.add_argument_group("portfolio Kelly")
-    g.add_argument("--portfolio", nargs="+",
-                   help="Optimize joint Kelly weights for these tickers")
-    g.add_argument("--portfolio-top", type=int,
-                   help="Optimize joint Kelly weights for the top N by standalone Kelly")
-    g.add_argument("--max-weight", type=float, default=PORTFOLIO_MAX_WEIGHT,
-                   help=f"Per-name cap (default {PORTFOLIO_MAX_WEIGHT}; book ceiling {BOOK_MAX_WEIGHT})")
-    g.add_argument("--max-leverage", type=float, default=PORTFOLIO_MAX_LEVERAGE,
-                   help=f"Max total invested; >1 allows margin (default {PORTFOLIO_MAX_LEVERAGE})")
-    g.add_argument("--shrink", type=float, default=COV_SHRINK,
-                   help=f"Covariance shrinkage toward diagonal, 0-1 (default {COV_SHRINK})")
+    s = p.add_argument_group("sizing (same settings as the app)")
+    s.add_argument("--fraction", choices=list(FRACTIONS), default="half",
+                   help="Kelly fraction to show (default half; all four are saved)")
+    s.add_argument("--amount", type=float, default=10_000,
+                   help="Dollars to allocate (default 10,000)")
+    s.add_argument("--horizon", type=float, default=DEFAULT_HORIZON,
+                   help=f"Buy-and-hold years (default {DEFAULT_HORIZON:g})")
+    s.add_argument("--max-weight", type=float, default=PORTFOLIO_MAX_WEIGHT,
+                   help=f"Max per name (default {PORTFOLIO_MAX_WEIGHT:g}; "
+                        f"book ceiling {BOOK_MAX_WEIGHT:g})")
+    s.add_argument("--max-invested", "--max-leverage", dest="max_invested", type=float,
+                   default=PORTFOLIO_MAX_LEVERAGE,
+                   help="Max total invested; 1.0 = no margin (default)")
+    s.add_argument("--shrink", type=float, default=COV_SHRINK,
+                   help=f"Correlation shrinkage toward independence (default {COV_SHRINK:g})")
+    s.add_argument("--market-return", type=float, default=MARKET_RETURN,
+                   help=f"Long-run market return for CAPM names (default {MARKET_RETURN})")
+    s.add_argument("--scenarios", type=int, default=N_SCENARIOS, help=argparse.SUPPRESS)
 
-    v = p.add_argument_group("your views (edge from research)")
-    v.add_argument("--views", type=Path,
-                   help="CSV: ticker,p_bear,bear[,p_base,base],bull and/or value[,notes]; "
-                        "see views.example.csv")
-    v.add_argument("--horizon", type=float, default=DEFAULT_HORIZON,
-                   help=f"Buy-and-hold horizon in years (default {DEFAULT_HORIZON:g})")
-    v.add_argument("--scenarios", type=int, default=N_SCENARIOS,
-                   help=f"Simulated joint outcomes (default {N_SCENARIOS:,})")
+    r = p.add_argument_group("your research")
+    r.add_argument("--views", type=Path, default=Path("views.csv"),
+                   help="Views CSV (default views.csv in this folder, if present)")
+    r.add_argument("--journal", type=Path, default=Path("journal.csv"),
+                   help="Journal CSV (default journal.csv in this folder)")
+    r.add_argument("--log", action="store_true", help="Log today's views to the journal")
+    r.add_argument("--report", action="store_true", help="Show the journal report only")
 
-    jg = p.add_argument_group("conviction journal")
-    jg.add_argument("--journal", type=Path,
-                    help="Journal CSV: prints calibration and open calls")
-    jg.add_argument("--log", action="store_true",
-                    help="Append today's views (with entry price) to --journal")
+    o = p.add_argument_group("output")
+    o.add_argument("--out-dir", type=Path, default=None,
+                   help="Folder for result CSVs (default Desktop, else this folder)")
+    o.add_argument("--no-save", action="store_true", help="Print only; don't write CSVs")
+
+    b = p.add_argument_group("no-edge baseline (opt-in)")
+    b.add_argument("--screen", action="store_true",
+                   help="Solo Kelly for every S&P 500 name under CAPM, saved to CSV")
+    b.add_argument("--extra", nargs="+", default=[], help="Add non-S&P names to the screen")
+    b.add_argument("--limit", type=int, help="Only the first N constituents (quick test)")
     args = p.parse_args(argv)
-    if args.log and not (args.journal and args.views):
-        p.error("--log needs both --views and --journal")
-    if args.max_weight > BOOK_MAX_WEIGHT:
-        log(f"Note: --max-weight {args.max_weight:.0%} is above the book's 40% ceiling "
-            f"(Buffett's largest position, American Express). Treat this as a what-if.")
 
-    views = load_views(args.views) if args.views else normalize_views(None)
+    tickers = [_yahoo_symbol(t).upper() for t in (args.tickers or args.portfolio or [])]
+    views = load_views(args.views) if args.views.exists() else normalize_views(None)
+    journal = load_journal(args.journal)
+    out_dir = args.out_dir or default_out_dir()
+    stamp = f"{date.today():%Y-%m-%d}"
+
+    if args.report:
+        if not len(journal):
+            print(f"No journal yet at {args.journal}. Log views with --log.")
+            return 0
+        print_journal(journal)
+        return 0
+    if not tickers and not args.screen:
+        tickers = list(views.index)
+        if not tickers:
+            p.print_help()
+            print("\nGive a basket, e.g.:  python kelly.py NVDA ASML KO MSFT VOO")
+            return 2
+    if args.max_weight > BOOK_MAX_WEIGHT:
+        print(f"Note: --max-weight {args.max_weight:.0%} is above the book's 40% ceiling "
+              f"(Buffett's largest position, American Express). Treat this as a what-if.")
     if len(views):
-        log(f"Views loaded for {len(views)} names: {', '.join(views.index)}")
+        print(f"Using your views from {args.views}: {', '.join(views.index)}")
 
     rf, rf_source = get_risk_free_rate()
-    log(f"Risk-free rate: {rf:.3%} ({rf_source})  |  "
-        f"Market premium: {args.market_return - rf:.3%}")
 
-    meta = get_sp500_constituents()
-    meta["universe"] = "S&P 500"
-    if args.tickers:
-        tickers = [_yahoo_symbol(t) for t in args.tickers]
-    else:
-        tickers = meta["ticker"].tolist()
-        if args.limit:
-            tickers = tickers[:args.limit]
-
-    # Extras + any portfolio names not already in the run
-    wanted = [_yahoo_symbol(t) for t in args.extra + (args.portfolio or [])
-              + list(views.index)]
-    add = [t for t in dict.fromkeys(wanted) if t not in tickers]
-    tickers += add
-    non_sp = [t for t in tickers if t not in set(meta["ticker"])]
-    if non_sp:
-        log(f"Non-S&P tickers: {', '.join(non_sp)}")
-        extra_meta = lookup_extra_meta(non_sp)
-        extra_meta["universe"] = "Extra"
-        meta = pd.concat([meta, extra_meta], ignore_index=True)
-
-    prices = download_monthly_closes(tickers + [BENCHMARK], VARIANCE_YEARS)
-    if prices.empty or BENCHMARK not in prices.columns:
-        log("ERROR: no price data returned. Check network / try again later.")
-        return 1
-
-    prices_now = download_latest_prices(list(views.index)) if len(views) else {}
-    missing = sorted(set(tickers) - set(prices.columns))
-    res = compute_kelly(prices, rf, args.market_return,
-                        views=views, horizon=args.horizon, prices_now=prices_now)
-    if missing:
-        res = pd.concat([res, pd.DataFrame({"ticker": missing,
-                                            "status": "no price data"})])
-
-    res = meta.merge(res, on="ticker", how="right")
-    res.insert(0, "run_date", date.today().isoformat())
-    res["risk_free_rate"] = rf
-    res["market_return"] = args.market_return
-    res = res.sort_values("full_kelly", ascending=False, na_position="last")
-
-    ok = res[res["status"] == "ok"]
-    log(f"\nComputed {len(ok)} of {len(tickers)} tickers.")
-    show = ["ticker", "edge_source", "sector", "beta", "annual_volatility",
-            "margin_of_safety", "full_kelly", "half_kelly"]
-    show = [c for c in show if c in ok.columns]
-    with pd.option_context("display.float_format", "{:.3f}".format,
-                           "display.width", 160):
-        log("\nTop 20 by full Kelly:\n" + ok[show].head(20).to_string(index=False))
-
-    out = args.out or default_output()
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out = safe_to_csv(res, out)
-    log(f"\nSaved: {out}")
-
-    # ---- optional portfolio Kelly
-    basket = None
-    if args.portfolio:
-        basket = [_yahoo_symbol(t) for t in args.portfolio]
-    elif args.portfolio_top:
-        basket = ok["ticker"].head(args.portfolio_top).tolist()
-    if basket:
-        try:
-            weights, summary = portfolio_kelly(
-                prices, res, basket, rf,
-                max_weight=args.max_weight,
-                max_leverage=args.max_leverage,
-                shrink=args.shrink,
-                horizon=args.horizon,
-                n_scenarios=args.scenarios,
-            )
-        except ValueError as e:
-            log(f"\nPortfolio Kelly skipped: {e}")
+    # ---- the no-edge baseline (opt-in)
+    if args.screen:
+        print("Screening the S&P 500 under CAPM, the no-edge baseline. This ranks risk, "
+              "not opportunities.")
+        res = screen_sp500(rf, args.market_return, args.horizon, views,
+                           args.extra, args.limit)
+        ok = res[res["status"] == "ok"]
+        cols = [c for c in ["ticker", "edge_source", "sector", "beta",
+                            "annual_volatility", "full_kelly", "half_kelly"] if c in ok]
+        print(f"\nTop 20 of {len(ok)} by solo Kelly ({args.horizon:g}-year hold):\n"
+              + _fmt_table(ok[cols].head(20), pct=["annual_volatility", "full_kelly",
+                                                   "half_kelly"]))
+        if not args.no_save:
+            print(f"Saved: {safe_to_csv(res, out_dir / f'kelly_screen_{stamp}.csv')}")
+        if not tickers:
             return 0
-        stamp = f"{date.today():%Y-%m-%d}"
-        w_path = out.parent / f"kelly_portfolio_{stamp}.csv"
-        s_path = out.parent / f"kelly_portfolio_summary_{stamp}.csv"
-        w_path = safe_to_csv(weights, w_path)
-        s_path = safe_to_csv(summary, s_path)
-        wcols = ["ticker", "edge_source", "weight_full_kelly", "weight_half_kelly",
-                 "weight_quarter_kelly", "standalone_full_kelly"]
-        wcols = [c for c in wcols if c in weights.columns]
-        with pd.option_context("display.float_format", "{:.3f}".format,
-                               "display.width", 160):
-            log("\nPortfolio Kelly weights:\n" + weights[wcols].to_string(index=False))
-            log("\nPortfolio summary:\n" + summary.drop(columns=["solver_ok"]).to_string(index=False))
-        if not summary["solver_ok"].all():
-            log("WARNING: optimizer did not fully converge for some fractions.")
-        log(f"\nSaved: {w_path}\nSaved: {s_path}")
+
+    # ---- size the basket
+    if len(tickers) < 2:
+        print("Give at least 2 tickers.")
+        return 2
+    prices = download_monthly_closes(sorted(set(tickers)) + [BENCHMARK], VARIANCE_YEARS)
+    if prices.empty or BENCHMARK not in prices.columns:
+        print("ERROR: no price data came back from Yahoo. Try again in a minute.")
+        return 1
+    in_basket = views.loc[[t for t in tickers if t in views.index]]
+    prices_now = download_latest_prices(list(in_basket.index)) if len(in_basket) else {}
+    try:
+        with captured_log() as logs:
+            results, weights, summary = size_basket(
+                prices, tickers, rf, views=in_basket if len(in_basket) else None,
+                prices_now=prices_now, market_return=args.market_return,
+                horizon=args.horizon, max_weight=args.max_weight,
+                max_leverage=args.max_invested, shrink=args.shrink,
+                n_scenarios=args.scenarios)
+    except ValueError as e:
+        print(f"Can't size this basket: {e}")
+        return 2
+
+    frac = args.fraction
+    print(f"\nKelly Sizer · {FRACTION_NAMES[frac]} Kelly · ${args.amount:,.0f} · "
+          f"{args.horizon:g}-year hold")
+    print(basket_message(summary))
+    stats = headline(summary, frac)
+    for row in (stats[:3], stats[3:]):
+        print("  " + "   ".join(f"{label}: {value}" for label, value, _ in row))
+    alloc = allocation_table(weights, frac, args.amount).rename(columns={
+        "ticker": "Ticker", "weight": "Weight", "dollars": "$", "edge": "Edge",
+        "margin_of_safety": "MoS", "solo_kelly": "Solo Kelly", "swing": "Swing"})
+    print("\n" + _fmt_table(alloc, pct=["Weight", "MoS", "Solo Kelly", "Swing"], money=["$"]))
+    wide, fstats = fractions_table(weights, summary)
+    print("\nAll fractions:\n" + _fmt_table(fstats.reset_index(),
+                                            pct=[c for c in fstats.columns]))
+    print(run_note(summary, rf, rf_source, logs))
+    if not summary["solver_ok"].all():
+        print("WARNING: optimizer did not fully converge for some fractions.")
+
+    if not args.no_save:
+        w_path = safe_to_csv(weights, out_dir / f"kelly_portfolio_{stamp}.csv")
+        s_path = safe_to_csv(summary, out_dir / f"kelly_portfolio_summary_{stamp}.csv")
+        print(f"Saved: {w_path}\nSaved: {s_path}")
 
     # ---- conviction journal
-    if args.journal:
-        journal = load_journal(args.journal)
-        if args.log:
+    if args.log:
+        if not len(in_basket):
+            print("Nothing to log: no names in this basket have views.")
+        else:
             last = prices.ffill().iloc[-1].to_dict()
-            resolved = resolve_views(views, {**last, **prices_now})
+            resolved = resolve_views(in_basket, {**last, **prices_now})
             journal = append_journal(journal, journal_entries(resolved, args.horizon))
-            args.journal.parent.mkdir(parents=True, exist_ok=True)
-            journal.to_csv(args.journal, index=False)
-            log(f"\nJournal: logged {len(resolved)} views to {args.journal}")
-        now = {**prices.ffill().iloc[-1].to_dict(),
-               **download_latest_prices(sorted(set(journal["ticker"])))}
-        entries, jsum, calib = journal_report(journal, now)
-        log(f"\nJournal: {jsum['entries']} calls · {jsum['resolved']} resolved · "
-            f"{jsum['due']} due for an outcome · {jsum['open']} open")
-        if jsum["resolved"]:
-            log(f"  Brier score {jsum['brier']:.3f} (0 = perfect; lower is better) · "
-                f"avg probability you gave to what happened {jsum['avg_prob_of_actual']:.0%}")
-            log(f"  {jsum['verdict']}")
-            with pd.option_context("display.float_format", "{:.2f}".format):
-                log(calib.to_string(index=False))
-        due = entries[entries["status"] == "due"]
-        if len(due):
-            log("  Due: record bear/base/bull in the outcome column for "
-                + ", ".join(f"{t} ({d})" for t, d in zip(due["ticker"], due["date"])))
+            safe_to_csv(journal, args.journal)
+            print(f"Logged {len(resolved)} views to {args.journal}")
+    if len(journal):
+        print_journal(journal)
     return 0
 
 
