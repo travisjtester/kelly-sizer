@@ -87,7 +87,7 @@ Tickers in the views file are added to the run automatically. A name with a view
 |---|---|
 | Kelly maximizes expected log of wealth; edge/odds (pp. 75–76) | Views engine objective; binary closed form for solo Kelly |
 | Edge comes from fundamental analysis of probability and risk/reward (p. 2) | `p_win`, `upside`, `downside` |
-| Risk = permanent loss of capital, not volatility (p. 3) | `downside` is permanent loss; volatility is only used for names without a view |
+| Risk = permanent loss of capital, not volatility (p. 3) | `downside` is permanent loss; app headline leads with chance of loss; volatility shown as "price swings"; backtest opt-in |
 | Size bets jointly; isolated Kelly "generally overestimates" (p. 105) | Portfolio solved as one basket; solo Kelly shown as a ceiling |
 | Kelly is the maximum bet; half Kelly ≈ ¾ of the growth, ½ the volatility (pp. 85–86) | Fractions; leverage capped at 1.0 by default |
 | Buffett: "25 percent for the largest," up to 40% (p. 96) | `--max-weight` default 0.25 |
@@ -109,6 +109,8 @@ streamlit run app.py          # local: opens http://localhost:8501
 **Your research in the app:** open **Your research (views)**, fill Win % / Upside % / Downside % for any picked ticker (blank = CAPM), and the app switches to views mode. Use **Save views CSV** to keep them (iPhone saves to Files) and the uploader to load them back. To have the app start with your views, commit a `views.csv` at the repo root (`git add -f views.csv`, since `*.csv` is gitignored). Only do that if you're fine with it being as public as the repo.
 
 After the first **Size it**, results update live as you change tickers, research, or settings.
+
+**How the app frames risk (following the book):** the headline leads with **Chance of loss** and the **1-in-20 worst case** over the horizon. In views mode both come from your permanent-loss inputs, matching the book's definition of risk. **Price swings** (volatility) are shown separately: not risk, but the ride you have to sit through, which is why fractional Kelly exists. The **price-history check** (backtest vs. the S&P 500) is optional and off by default, since it's outside the book's method and can't test your views. Turning it off also skips the full-history download.
 
 Prices are cached 12h per basket, the risk-free rate 6h, and the constituent list 24h, so repeat taps are instant and Yahoo isn't hammered.
 
