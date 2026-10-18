@@ -4,3 +4,6 @@ __pycache__/
 venv/
 *.csv
 .DS_Store
+
+# keep the example views file
+!views.example.csv

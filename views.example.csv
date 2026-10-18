@@ -1,0 +1,4 @@
+ticker,p_win,upside,downside,notes
+NVDA,0.60,0.80,0.40,"Example only: AI capex cycle continues 3 yrs vs. capex bust"
+ASML,0.70,0.60,0.30,"Example only: EUV monopoly; downside = multiple compression"
+KO,0.80,0.25,0.10,"Example only: steady compounder, little permanent-loss risk"

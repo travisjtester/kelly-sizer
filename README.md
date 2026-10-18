@@ -1,6 +1,10 @@
 # Kelly Criterion S&P 500 Screener
 
-Computes CAPM-based Kelly allocations for every S&P 500 constituent (plus any extra tickers) and writes a dated CSV. Optionally solves joint Kelly weights for a basket, accounting for correlation between holdings.
+Kelly Criterion position sizing, inspired by *Concentrated Investing* (Benello, van Biema & Carlisle, Wiley 2016), chapters 3–4.
+
+- **Screener:** CAPM-based Kelly for every S&P 500 constituent (plus extras), written to a dated CSV.
+- **Portfolio Kelly:** joint weights for a basket, accounting for correlation (Thorp's "joint properties" rule).
+- **Views mode:** size on *your* edge, meaning probability of winning, upside, and permanent downside from your own research, which is how the book's investors use Kelly. Names without a view fall back to CAPM.
 
 ## Setup
 ```bash
@@ -41,6 +45,54 @@ Writes two extra files next to the main CSV: `kelly_portfolio_YYYY-MM-DD.csv` (w
 | `--max-leverage` | 1.0 | Max total invested; >1 allows margin |
 | `--shrink` | 0.20 | Covariance shrinkage toward diagonal (0 = raw sample) |
 
+## Views mode (your own edge)
+CAPM assumes no stock has an edge, so on its own it sizes by risk. The book's investors find edge through fundamental research and size on it. Give the script your three Kelly inputs per name:
+
+```csv
+ticker,p_win,upside,downside,notes
+NVDA,0.60,0.80,0.40,"AI capex continues vs. capex bust"
+ASML,70,60,30,"EUV monopoly"
+```
+
+| Column | Meaning |
+|---|---|
+| `p_win` | Probability the thesis plays out over the horizon |
+| `upside` | Gain if it does (`0.8` = +80%; `1.5` = +150%) |
+| `downside` | **Permanent** loss if it doesn't (`0.4` = −40%). Not a price dip; the book defines risk as permanent loss of capital |
+| `notes` | Optional |
+
+Use decimals or percents consistently within a column; a `%` sign always means percent. Start from `views.example.csv`.
+
+```bash
+python kelly_sp500.py --views views.csv --portfolio NVDA ASML KO MSFT VOO
+python kelly_sp500.py --views views.csv --portfolio NVDA ASML KO --horizon 5 --max-weight 0.40
+```
+
+Tickers in the views file are added to the run automatically. A name with a view is kept even with short price history (e.g. a recent IPO); it's treated as uncorrelated if it has under 12 months of prices.
+
+**How it sizes**
+- **Solo Kelly** for a viewed name is the exact binary bet against cash at the horizon: `f* = (1+Rf)·(p/(a+Rf) − q/(b−Rf))` (b = upside, a = downside, Rf = risk-free over the horizon). With Rf = 0 and a total-loss downside it is the book's `(bp − q)/b`; the book's worked example (51%, even money) gives 2%.
+- **Portfolio (views engine):** simulates 20,000 joint outcomes over the horizon with a Gaussian copula on historical correlations. Viewed names win or take their permanent loss; other names are lognormal with CAPM mean and historical volatility. It then maximizes **expected log wealth** for the whole basket at once. A position set that could wipe out the portfolio scores −∞, so the result never risks ruin. Fractional Kelly scales the full-Kelly bets (half Kelly = bet half). The seed is fixed, so reruns are identical.
+- If no basket name has a view, the CAPM engine below runs unchanged.
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--views` | — | Views CSV |
+| `--horizon` | 3 | Years for theses to play out |
+| `--scenarios` | 20000 | Simulated joint outcomes |
+
+**How the book's principles map to the tool**
+
+| Book (page) | Tool |
+|---|---|
+| Kelly maximizes expected log of wealth; edge/odds (pp. 75–76) | Views engine objective; binary closed form for solo Kelly |
+| Edge comes from fundamental analysis of probability and risk/reward (p. 2) | `p_win`, `upside`, `downside` |
+| Risk = permanent loss of capital, not volatility (p. 3) | `downside` is permanent loss; volatility is only used for names without a view |
+| Size bets jointly; isolated Kelly "generally overestimates" (p. 105) | Portfolio solved as one basket; solo Kelly shown as a ceiling |
+| Kelly is the maximum bet; half Kelly ≈ ¾ of the growth, ½ the volatility (pp. 85–86) | Fractions; leverage capped at 1.0 by default |
+| Buffett: "25 percent for the largest," up to 40% (p. 96) | `--max-weight` default 0.25 |
+| Concentrate in 5–20 names (p. 3) | App takes up to 15 |
+
 ## Phone app (Streamlit)
 `app.py` is a mobile-friendly front end: pick up to 15 tickers, choose a Kelly fraction and a dollar amount, and get the allocation table plus portfolio stats.
 
@@ -53,6 +105,10 @@ streamlit run app.py          # local: opens http://localhost:8501
 2. Go to share.streamlit.io → **Create app** → pick the repo, branch, and `app.py`.
 3. In app settings, restrict viewers to your email if you want it private.
 4. On iPhone: open the URL in Safari → Share → **Add to Home Screen**.
+
+**Your research in the app:** open **Your research (views)**, fill Win % / Upside % / Downside % for any picked ticker (blank = CAPM), and the app switches to views mode. Use **Save views CSV** to keep them (iPhone saves to Files) and the uploader to load them back. To have the app start with your views, commit a `views.csv` at the repo root (`git add -f views.csv`, since `*.csv` is gitignored). Only do that if you're fine with it being as public as the repo.
+
+After the first **Size it**, results update live as you change tickers, research, or settings.
 
 Prices are cached 12h per basket, the risk-free rate 6h, and the constituent list 24h, so repeat taps are instant and Yahoo isn't hammered.
 
@@ -98,6 +154,11 @@ Sorted by `full_kelly` descending; rows with no result sort last. Rates and weig
 | `status` | `ok`, `insufficient history (N mo)`, or `no price data` |
 | `risk_free_rate` | 10Y Treasury yield used for the run |
 | `market_return` | Long-run market return assumption used for the run |
+| `edge_source` | `views` if the Kelly columns come from your view, else `CAPM` |
+| `p_win`, `upside`, `downside`, `horizon_years` | Your view, as fractions (views only) |
+| `view_expected_return` | `p·upside − (1−p)·downside` over the horizon |
+| `view_annualized_return` | The same, annualized |
+| `capm_full_kelly` | CAPM Kelly for comparison (`full_kelly` holds the view-based figure when `edge_source = views`) |
 
 ## Output: `kelly_portfolio_YYYY-MM-DD.csv`
 One row per basket name plus a `CASH` row. Each weight column sums to 1.
@@ -106,10 +167,11 @@ One row per basket name plus a `CASH` row. Each weight column sums to 1.
 |---|---|
 | `weight_full_kelly` … `weight_eighth_kelly` | Optimal portfolio weight at that Kelly fraction |
 | `standalone_full_kelly` | The same name's single-asset Kelly, for comparison |
+| `edge_source`, `p_win`, `upside`, `downside` | Where each name's edge came from |
 | `name`, `sector`, `universe`, `beta`, `annual_volatility`, `expected_return` | Carried from the main output |
 
 ## Output: `kelly_portfolio_summary_YYYY-MM-DD.csv`
-One row per Kelly fraction: `invested`, `cash`, `holdings`, `expected_return`, `volatility`, `sharpe`, `expected_growth_rate` (≈ return − variance/2), `months_used`, `solver_ok`.
+One row per Kelly fraction: `engine` (`CAPM` or `views`), `horizon_years`, `invested`, `cash`, `holdings`, `expected_return` (annualized), `volatility`, `sharpe`, `expected_growth_rate` (annualized compound), `prob_loss` (chance of ending below the starting value over the horizon), `worst_5pct` (5th-percentile return over the horizon), `months_used`, `solver_ok`. CAPM mode reports `prob_loss`/`worst_5pct` over 1 year (lognormal approximation).
 
 ## Operational notes
 - **FRED timeouts** are common from scripts (likely bot protection); the run falls back to Yahoo `^TNX`, which is the same 10Y yield. Not an error.
@@ -119,7 +181,9 @@ One row per Kelly fraction: `invested`, `cash`, `holdings`, `expected_return`, `
 
 ## Caveats
 - Standalone Kelly sizes each stock **in isolation**; that column won't sum to 100%. Use portfolio Kelly to size a basket.
-- Under CAPM, Kelly reduces to `beta * MRP / variance`. Rankings reflect risk structure, not stock-specific alpha.
+- Under CAPM, Kelly reduces to `beta * MRP / variance`. Rankings reflect risk structure, not stock-specific alpha. Add views to size on conviction.
+- **Views mode is only as good as your inputs.** Kelly sizes on the edge you give it, so overconfident `p_win` or understated `downside` produce oversized bets. Thorp's warning (p. 105): misjudging the downside or a Black Swan means the computed Kelly is too big. This is another reason to use half or quarter Kelly.
+- Views share one horizon. Correlations between theses are borrowed from how the stocks have moved together, which is a reasonable default, not a certainty.
 - `cagr_gap` is backward-looking. A large positive gap can mean a great business or a one-time re-rating.
 - Extras (e.g. TSM, ASML ADRs) are priced in USD, so FX moves are baked into their returns. Beta is still measured against the S&P 500.
 - Full Kelly is aggressive; half or quarter is the common practical choice.

@@ -155,45 +155,125 @@ def capture_logs():
 
 # --------------------------------------------------------------------- UI ---
 st.title("📐 Kelly Sizer")
-st.caption("Joint Kelly weights for a basket, with correlations and position caps.")
+st.caption("Joint Kelly weights for a basket, with correlations and position caps. "
+           "Add your own research to size on conviction.")
 
 meta = sp500_list()
 options = sorted(set(meta["ticker"]) | set(DEFAULT_TICKERS))
+VIEW_EDIT_COLS = {"p_win": "Win %", "upside": "Upside %", "downside": "Downside %"}
 
-with st.form("inputs"):
-    picks = st.multiselect(
-        "Tickers (type any symbol, e.g. TSM, ASML, VOO)",
-        options=options,
-        default=DEFAULT_TICKERS,
-        max_selections=15,
-        accept_new_options=True,
-    )
-    c1, c2 = st.columns(2)
-    fraction_label = c1.radio("Kelly fraction", list(FRACTIONS), index=1, horizontal=True)
-    amount = c2.number_input("Amount to allocate ($)", min_value=0, value=10_000,
-                             step=1_000)
 
-    with st.expander("Settings"):
-        max_weight = st.slider("Max per name", 0.05, 1.0, ks.PORTFOLIO_MAX_WEIGHT, 0.05,
-                               format="%.2f")
-        max_lev = st.slider("Max invested (1.0 = no margin)", 0.5, 2.0,
-                            ks.PORTFOLIO_MAX_LEVERAGE, 0.1)
-        shrink = st.slider("Covariance shrinkage", 0.0, 1.0, ks.COV_SHRINK, 0.05)
-        mkt_ret = st.number_input("Long-run market return", 0.0, 0.30,
-                                  ks.MARKET_RETURN, 0.005, format="%.4f")
-        log_scale = st.checkbox("Log scale on backtest chart",
-                                help="Each gridline is a doubling. Better for long histories.")
+def _init_views() -> dict:
+    """Start from views.csv in the repo if present (git add -f views.csv)."""
+    try:
+        v = ks.load_views("views.csv")
+        return {t: dict(r) for t, r in v[ks.VIEW_COLS].iterrows()}
+    except Exception:
+        return {}
 
-    run = st.form_submit_button("Size it", type="primary", width="stretch")
 
-if not run:
-    st.info("Pick 2–15 tickers and tap **Size it**.")
-    st.stop()
+if "views" not in st.session_state:
+    st.session_state.views = _init_views()
+if "ran" not in st.session_state:
+    st.session_state.ran = False
+if "ticker_options" not in st.session_state:
+    # Frozen per session: if the option list changes, Streamlit treats the
+    # picker as a new widget and resets the basket to the defaults.
+    st.session_state.ticker_options = sorted(set(options) | set(st.session_state.views))
 
+picks = st.multiselect(
+    "Tickers (type any symbol, e.g. TSM, ASML, VOO)",
+    options=st.session_state.ticker_options,
+    default=DEFAULT_TICKERS,
+    max_selections=15,
+    accept_new_options=True,
+    key="picks",
+)
 tickers = list(dict.fromkeys(ks._yahoo_symbol(t).upper() for t in picks))
+
+with st.expander("Your research (views)", expanded=bool(st.session_state.views)):
+    st.caption(
+        "The book's Kelly inputs, from your own analysis. **Win %**: chance the thesis "
+        "plays out over the horizon. **Upside %**: gain if it does. **Downside %**: "
+        "*permanent* loss if it doesn't (not a price dip). Leave a row blank to use CAPM."
+    )
+    store = st.session_state.views
+    grid = pd.DataFrame(
+        [{"ticker": t,
+          **{c: (store[t][c] * 100 if t in store else None) for c in VIEW_EDIT_COLS}}
+         for t in tickers]
+    )
+    edited = st.data_editor(
+        grid, hide_index=True, width="stretch", key=f"views_{'_'.join(tickers)}",
+        disabled=["ticker"],
+        column_config={
+            "ticker": st.column_config.TextColumn("Ticker"),
+            "p_win": st.column_config.NumberColumn("Win %", min_value=1, max_value=99,
+                                                   step=5, format="%d%%"),
+            "upside": st.column_config.NumberColumn("Upside %", min_value=1, step=5,
+                                                    format="%d%%"),
+            "downside": st.column_config.NumberColumn("Downside %", min_value=1,
+                                                      max_value=100, step=5,
+                                                      format="%d%%"),
+        },
+    )
+    for _, r in edited.iterrows():
+        vals = [r[c] for c in VIEW_EDIT_COLS]
+        if all(pd.notna(v) for v in vals):
+            store[r["ticker"]] = {c: float(r[c]) / 100 for c in VIEW_EDIT_COLS}
+        else:
+            store.pop(r["ticker"], None)
+
+    up, down = st.columns(2)
+    file = up.file_uploader("Load views CSV", type="csv", label_visibility="collapsed")
+    if file is not None and st.session_state.get("_loaded") != file.file_id:
+        try:
+            loaded = ks.normalize_views(pd.read_csv(file))
+            store.update({t: dict(r) for t, r in loaded[ks.VIEW_COLS].iterrows()})
+            st.session_state._loaded = file.file_id
+            st.rerun()
+        except ValueError as e:
+            st.error(str(e))
+    if store:
+        csv = (pd.DataFrame.from_dict(store, orient="index").rename_axis("ticker")
+               .reset_index().to_csv(index=False))
+        down.download_button("Save views CSV", csv, "views.csv", "text/csv",
+                             width="stretch")
+
+c1, c2 = st.columns(2)
+fraction_label = c1.radio("Kelly fraction", list(FRACTIONS), index=1, horizontal=True)
+amount = c2.number_input("Amount to allocate ($)", min_value=0, value=10_000, step=1_000)
+
+with st.expander("Settings"):
+    horizon = st.slider("Thesis horizon (years)", 1.0, 10.0, ks.DEFAULT_HORIZON, 0.5,
+                        help="How long your views take to play out. Used only when "
+                             "at least one name has a view.")
+    max_weight = st.slider("Max per name", 0.05, 1.0, ks.PORTFOLIO_MAX_WEIGHT, 0.05,
+                           format="%.2f",
+                           help="Buffett: '25 percent for the largest'; "
+                                "40% for an American Express-level idea.")
+    max_lev = st.slider("Max invested (1.0 = no margin)", 0.5, 2.0,
+                        ks.PORTFOLIO_MAX_LEVERAGE, 0.1)
+    shrink = st.slider("Covariance shrinkage", 0.0, 1.0, ks.COV_SHRINK, 0.05)
+    mkt_ret = st.number_input("Long-run market return", 0.0, 0.30,
+                              ks.MARKET_RETURN, 0.005, format="%.4f")
+    log_scale = st.checkbox("Log scale on backtest chart",
+                            help="Each gridline is a doubling. Better for long histories.")
+
+if st.button("Size it", type="primary", width="stretch"):
+    st.session_state.ran = True
+if not st.session_state.ran:
+    st.info("Pick 2–15 tickers, optionally add your research, and tap **Size it**. "
+            "After that, results update as you change things.")
+    st.stop()
 if len(tickers) < 2:
     st.warning("Pick at least 2 tickers.")
     st.stop()
+
+views = ks.normalize_views(
+    pd.DataFrame([{"ticker": t, **v} for t, v in st.session_state.views.items()
+                  if t in tickers])
+) if any(t in st.session_state.views for t in tickers) else None
 
 logs = capture_logs()
 with st.spinner("Pulling prices and solving…"):
@@ -203,7 +283,7 @@ with st.spinner("Pulling prices and solving…"):
         st.error("No price data came back from Yahoo. Try again in a minute.")
         st.stop()
 
-    results = ks.compute_kelly(prices, rf, mkt_ret)
+    results = ks.compute_kelly(prices, rf, mkt_ret, views=views, horizon=horizon)
     missing = [t for t in tickers if t not in prices.columns]
     if missing:
         results = pd.concat([results, pd.DataFrame({"ticker": missing,
@@ -214,7 +294,7 @@ with st.spinner("Pulling prices and solving…"):
         weights, summary = ks.portfolio_kelly(prices, results, tickers, rf,
                                               max_weight=max_weight,
                                               max_leverage=max_lev,
-                                              shrink=shrink)
+                                              shrink=shrink, horizon=horizon)
     except ValueError as e:
         st.error(str(e))
         st.stop()
@@ -222,19 +302,26 @@ with st.spinner("Pulling prices and solving…"):
 frac = FRACTIONS[fraction_label]
 wcol = f"weight_{frac}_kelly"
 s = summary.set_index("kelly_fraction").loc[frac]
+views_mode = s["engine"] == "views"
+hz = f"{s['horizon_years']:g}y"
+
+if views_mode:
+    st.success(f"Views mode: sized on your research over a {s['horizon_years']:g}-year "
+               f"horizon. Names without a view use CAPM.")
 
 # ---- headline numbers
 m1, m2, m3 = st.columns(3)
 m1.metric("Invested", f"{s['invested']:.0%}")
 m2.metric("Cash", f"{s['cash']:.0%}")
-m3.metric("Exp. growth", f"{s['expected_growth_rate']:.1%}")
+m3.metric("Exp. growth", f"{s['expected_growth_rate']:.1%}/yr")
 m4, m5, m6 = st.columns(3)
-m4.metric("Exp. return", f"{s['expected_return']:.1%}")
-m5.metric("Volatility", f"{s['volatility']:.1%}")
-m6.metric("Sharpe", f"{s['sharpe']:.2f}")
+m4.metric("Exp. return", f"{s['expected_return']:.1%}/yr")
+m5.metric(f"Chance of loss ({hz})", f"{s['prob_loss']:.0%}")
+m6.metric(f"Worst 5% ({hz})", f"{s['worst_5pct']:.0%}")
 
 # ---- allocation table
-tbl = weights[["ticker", wcol, "standalone_full_kelly", "annual_volatility", "beta"]].copy()
+cols = ["ticker", wcol, "edge_source", "standalone_full_kelly", "annual_volatility", "beta"]
+tbl = weights[[c for c in cols if c in weights.columns]].copy()
 tbl = tbl.rename(columns={wcol: "weight"})
 tbl["dollars"] = tbl["weight"] * amount
 tbl = pd.concat([tbl[tbl.ticker != "CASH"].sort_values("weight", ascending=False),
@@ -244,8 +331,9 @@ for c in ["weight", "standalone_full_kelly", "annual_volatility"]:
 
 st.subheader(f"{fraction_label} Kelly allocation")
 st.dataframe(
-    tbl[["ticker", "weight", "dollars", "standalone_full_kelly",
-         "annual_volatility", "beta"]],
+    tbl[[c for c in ["ticker", "weight", "dollars", "edge_source",
+                     "standalone_full_kelly", "annual_volatility", "beta"]
+         if c in tbl.columns]],
     hide_index=True,
     width="stretch",
     column_config={
@@ -253,6 +341,7 @@ st.dataframe(
         "weight": st.column_config.ProgressColumn("Weight", format="%.1f%%",
                                                   min_value=0, max_value=100),
         "dollars": st.column_config.NumberColumn("$", format="$%,.0f"),
+        "edge_source": st.column_config.TextColumn("Edge"),
         "standalone_full_kelly": st.column_config.NumberColumn("Solo Kelly",
                                                                format="%.0f%%"),
         "annual_volatility": st.column_config.NumberColumn("Vol", format="%.0f%%"),
@@ -268,7 +357,8 @@ with st.expander("Compare all Kelly fractions"):
                  width="stretch")
     st.dataframe(
         summary.set_index("kelly_fraction")[
-            ["invested", "expected_return", "volatility", "expected_growth_rate"]
+            ["invested", "expected_return", "volatility", "expected_growth_rate",
+             "prob_loss", "worst_5pct"]
         ].map(lambda x: f"{x:.1%}"),
         width="stretch",
     )
@@ -276,7 +366,7 @@ with st.expander("Compare all Kelly fractions"):
 # ---- notes
 notes = [m for m in logs if m.startswith("Portfolio:")]
 st.caption(
-    f"Risk-free {rf:.2%} ({rf_src}) · {int(s['months_used'])} months of shared history"
+    f"Risk-free {rf:.2%} ({rf_src}) · {int(s['months_used'])} months of price history"
     + (f" · {'; '.join(n.removeprefix('Portfolio: ') for n in notes)}" if notes else "")
 )
 if not bool(s["solver_ok"]):
@@ -306,6 +396,8 @@ else:
         f"{' (log scale: each gridline is a doubling)' if log_scale else ''}. "
         f"Portfolio {cagr(p):.1%}/yr, worst drop {max_drawdown(p):.0%} · "
         f"S&P 500 {cagr(b):.1%}/yr, worst drop {max_drawdown(b):.0%}."
+        + (" The backtest uses past prices only; it can't test your views."
+           if views_mode else "")
     )
     with st.expander("Backtest data"):
         yearly = values.resample("YE").last()
@@ -317,31 +409,42 @@ else:
 st.subheader("Methodology")
 st.markdown(
     f"""
-The **Kelly criterion** sizes each bet to maximize long-run compound growth. Bet too
-little and you leave growth on the table; bet too much and volatility drags growth
-down, eventually below zero. For a single stock the optimal fraction is
-*(expected return − risk-free rate) ÷ variance*, shown as **Solo Kelly** above. Holding
-several stocks at once, correlations matter: two names that move together are closer
-to one big bet, so the joint weights end up smaller than the solo figures.
+Inspired by *Concentrated Investing* (Benello, van Biema & Carlisle), chapters 3–4.
 
-Full Kelly is the growth-maximizing size, but it's a rough ride and very sensitive to
-errors in the return estimates. **Half Kelly** keeps about 75% of the growth with half
-the volatility, which is why fractions are the usual choice.
+The **Kelly criterion** sizes each bet to maximize the expected *logarithm* of wealth,
+i.e. long-run compound growth. In the book's terms it's **edge ÷ odds**: no edge, no
+bet; a bigger edge or better odds, a bigger bet. Kelly is the *maximum* sensible size.
+Betting more adds risk without adding growth, which is why **half Kelly** (about 75% of
+the growth with half the volatility) is the common choice.
 
-- **Expected returns** come from CAPM: the 10-year Treasury yield plus each stock's
-  beta (5 years of monthly returns vs. the S&P 500) times the market risk premium
-  ({mkt_ret:.1%} long-run market return minus the risk-free rate).
-- **Risk** is the covariance of monthly returns over up to 10 years of shared history,
-  shrunk {shrink:.0%} toward its diagonal to damp estimation noise.
-- **Weights** maximize the basket's expected log growth (multi-asset Kelly), capped at
-  {max_weight:.0%} per name and {max_lev:.0%} invested in total. Fractional Kelly is solved
-  as higher risk aversion, not by scaling the full-Kelly weights. Anything not invested
-  sits in cash.
+**Where the edge comes from.** The book's investors find it through fundamental
+research, a "high-probability insight" with a margin of safety. That's what the
+**research table** captures: your probability that the thesis works, the upside if it
+does, and the *permanent* loss if it doesn't. The book defines risk as permanent loss,
+not volatility. Names without a view fall back to CAPM: the 10-year Treasury yield plus
+beta × the market premium ({mkt_ret:.1%} long-run market return minus the risk-free
+rate). CAPM assumes no edge, so it sizes by risk alone.
+
+**Sizing bets together.** Thorp's warning: computing each Kelly bet on its own
+"generally overestimates" it. You need the portfolio's joint properties. So weights are
+solved for the whole basket at once, using how the names have historically moved
+together (correlations shrunk {shrink:.0%} toward independence), capped at
+{max_weight:.0%} per name and {max_lev:.0%} invested in total. Anything not invested sits
+in cash.
+
+- **Views mode** (any name has a view): simulates {ks.N_SCENARIOS:,} correlated outcomes
+  over a {horizon:g}-year horizon, each viewed name winning or suffering its permanent
+  loss and the others following CAPM, then picks the weights with the highest
+  expected log wealth. A bet that could wipe out the portfolio scores −∞, so the
+  result never risks ruin. Fractional Kelly scales those bets (half Kelly = bet half).
+- **CAPM mode** (no views): the continuous form, *(expected return − risk-free) ÷
+  variance*, solved jointly from up to 10 years of monthly returns.
+- **Solo Kelly** is each name's Kelly on its own, a ceiling, not a target.
 - **The backtest** applies today's weights to each month's actual returns, with cash
   earning the 3-month T-bill rate and the S&P 500 including dividends. The weights were
-  chosen with hindsight on the same data, and it ignores costs and taxes, so treat it
-  as optimistic.
+  chosen with hindsight, and it ignores costs and taxes, so treat it as optimistic.
 
-Sizes reflect risk and correlation, not conviction. Not financial advice.
+Your inputs are the whole game here: Kelly sizes on the edge you give it, so optimistic
+views produce oversized bets. Not financial advice.
 """
 )
