@@ -276,8 +276,6 @@ with st.expander("Settings"):
     shrink = st.slider("Covariance shrinkage", 0.0, 1.0, ks.COV_SHRINK, 0.05)
     mkt_ret = st.number_input("Long-run market return", 0.0, 0.30,
                               ks.MARKET_RETURN, 0.005, format="%.4f")
-    log_scale = st.checkbox("Log scale on backtest chart",
-                            help="Each gridline is a doubling. Better for long histories.")
 
 if st.button("Size it", type="primary", width="stretch"):
     st.session_state.ran = True
@@ -329,14 +327,24 @@ if views_mode:
                f"horizon. Names without a view use CAPM.")
 
 # ---- headline numbers
+# The book defines risk as permanent loss of capital, so loss odds lead.
+loss_help = ("From your permanent-loss inputs" if views_mode
+             else "CAPM mode: estimated from price volatility (add views to use "
+                  "permanent-loss inputs)")
 m1, m2, m3 = st.columns(3)
-m1.metric("Invested", f"{s['invested']:.0%}")
-m2.metric("Cash", f"{s['cash']:.0%}")
-m3.metric("Exp. growth", f"{s['expected_growth_rate']:.1%}/yr")
+m1.metric(f"Chance of loss ({hz})", f"{s['prob_loss']:.0%}",
+          help=f"Chance the basket ends below where it started. {loss_help}.")
+m2.metric(f"Worst case, 1-in-20 ({hz})", f"{s['worst_5pct']:.0%}",
+          help="5th-percentile outcome over the horizon.")
+m3.metric("Exp. growth", f"{s['expected_growth_rate']:.1%}/yr",
+          help="Expected compound growth, what Kelly maximizes.")
 m4, m5, m6 = st.columns(3)
-m4.metric("Exp. return", f"{s['expected_return']:.1%}/yr")
-m5.metric(f"Chance of loss ({hz})", f"{s['prob_loss']:.0%}")
-m6.metric(f"Worst 5% ({hz})", f"{s['worst_5pct']:.0%}")
+m4.metric("Invested", f"{s['invested']:.0%}")
+m5.metric("Cash", f"{s['cash']:.0%}")
+m6.metric("Price swings", f"{s['volatility']:.0%}/yr",
+          help="How bumpy the ride is (annualized volatility). Not risk in the book's "
+               "sense, but it's what you have to sit through. It's why fractional "
+               "Kelly exists.")
 
 # ---- allocation table
 cols = ["ticker", wcol, "edge_source", "standalone_full_kelly", "annual_volatility", "beta"]
@@ -363,7 +371,9 @@ st.dataframe(
         "edge_source": st.column_config.TextColumn("Edge"),
         "standalone_full_kelly": st.column_config.NumberColumn("Solo Kelly",
                                                                format="%.0f%%"),
-        "annual_volatility": st.column_config.NumberColumn("Vol", format="%.0f%%"),
+        "annual_volatility": st.column_config.NumberColumn(
+            "Swing", format="%.0f%%",
+            help="Annual price volatility: how bumpy, not how risky"),
         "beta": st.column_config.NumberColumn("Beta", format="%.2f"),
     },
 )
@@ -376,9 +386,13 @@ with st.expander("Compare all Kelly fractions"):
                  width="stretch")
     st.dataframe(
         summary.set_index("kelly_fraction")[
-            ["invested", "expected_return", "volatility", "expected_growth_rate",
-             "prob_loss", "worst_5pct"]
-        ].map(lambda x: f"{x:.1%}"),
+            ["prob_loss", "worst_5pct", "expected_growth_rate", "invested",
+             "expected_return", "volatility"]
+        ].rename(columns={
+            "prob_loss": f"Chance of loss ({hz})", "worst_5pct": f"Worst 1-in-20 ({hz})",
+            "expected_growth_rate": "Exp. growth/yr", "invested": "Invested",
+            "expected_return": "Exp. return/yr", "volatility": "Price swings/yr",
+        }).rename_axis("Kelly").map(lambda x: f"{x:.1%}"),
         width="stretch",
     )
 
@@ -391,18 +405,32 @@ st.caption(
 if not bool(s["solver_ok"]):
     st.warning("Optimizer didn't fully converge for this fraction; treat as approximate.")
 
-# ---- backtest chart
-st.subheader("Backtest vs S&P 500")
+# ---- optional price-history check (outside the book's method)
+st.divider()
+show_bt = st.toggle(
+    "Price-history check (backtest)", value=False,
+    help="Optional. Replays today's weights on past prices. It isn't part of the "
+         "book's method and can't test your views.")
+if not show_bt:
+    st.caption("Off by default. The book sizes bets on forward-looking research, not "
+               "on how a basket happened to trade. Turn on to see how bumpy this mix "
+               "has been historically.")
 held = weights.set_index("ticker")[wcol].drop("CASH")
 held = held[held > 0]
 growth = None
-if not held.empty:
+log_scale = False
+if show_bt:
+    log_scale = st.checkbox("Log scale",
+                            help="Each gridline is a doubling. Better for long histories.")
+if show_bt and not held.empty:
     try:
         with st.spinner("Pulling full price history…"):
             growth = backtest(full_history(tuple(sorted(held.index))), held, rf)
     except Exception:
         pass
-if growth is None or len(growth) < 13:
+if not show_bt:
+    pass
+elif growth is None or len(growth) < 13:
     st.caption("Price history for the backtest isn't available right now.")
 else:
     start_value = amount or 10_000
@@ -415,8 +443,8 @@ else:
         f"{' (log scale: each gridline is a doubling)' if log_scale else ''}. "
         f"Portfolio {cagr(p):.1%}/yr, worst drop {max_drawdown(p):.0%} · "
         f"S&P 500 {cagr(b):.1%}/yr, worst drop {max_drawdown(b):.0%}."
-        + (" The backtest uses past prices only; it can't test your views."
-           if views_mode else "")
+        + " This replays past prices only: it shows the ride, not whether your "
+          "theses are right. Weights were chosen with hindsight; no costs or taxes."
     )
     with st.expander("Backtest data"):
         yearly = values.resample("YE").last()
@@ -459,9 +487,14 @@ in cash.
 - **CAPM mode** (no views): the continuous form, *(expected return − risk-free) ÷
   variance*, solved jointly from up to 10 years of monthly returns.
 - **Solo Kelly** is each name's Kelly on its own, a ceiling, not a target.
-- **The backtest** applies today's weights to each month's actual returns, with cash
-  earning the 3-month T-bill rate and the S&P 500 including dividends. The weights were
-  chosen with hindsight, and it ignores costs and taxes, so treat it as optimistic.
+- **Risk vs. swings.** Chance of loss and the 1-in-20 worst case lead because the book
+  defines risk as permanent loss of capital. **Price swings** (volatility) are shown
+  separately. They aren't risk, but they're the drawdowns you have to sit through, and
+  they're why Thorp recommends fractional Kelly.
+- **The price-history check** (optional, off by default) replays today's weights on past
+  monthly returns versus the S&P 500 with dividends. It's outside the book's method:
+  it can't test your views, the weights were chosen with hindsight, and it ignores
+  costs and taxes.
 
 Your inputs are the whole game here: Kelly sizes on the edge you give it, so optimistic
 views produce oversized bets. Not financial advice.
