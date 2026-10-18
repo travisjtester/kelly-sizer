@@ -1,24 +1,25 @@
 """
-Kelly Criterion screener for S&P 500 constituents.
+Kelly Criterion position sizing, after Concentrated Investing (Benello,
+van Biema & Carlisle, Wiley 2016), chapters 3-4.
 
 Pipeline
   1. Constituents  : Wikipedia (browser UA) -> GitHub datasets CSV fallback
   2. Risk-free rate: FRED DGS10 (no API key) -> Yahoo ^TNX fallback -> constant
   3. Prices        : ONE bulk yfinance download of monthly closes (auto-adjusted)
                      for every ticker + ^GSPC, in chunks, with retries
-  4. Per ticker    : beta (regressed vs ^GSPC, 5y monthly), CAPM expected
-                     return, annualized variance (10y monthly), Kelly fractions
-  5. Output        : CSV (Desktop by default) sorted by full Kelly
-  6. Optional      : multi-asset Kelly weights for a basket (--portfolio /
-                     --portfolio-top), accounting for correlations
-  7. Optional      : views mode (--views views.csv). Your own edge per name:
-                     probability of winning, upside, permanent downside.
-                     Sized by maximizing expected log wealth over correlated
-                     scenarios, following Concentrated Investing (Benello,
-                     van Biema, Carlisle) ch. 3-4.
+  4. Your views    : optional bear / base / bull scenarios per name (bear =
+                     permanent loss), bull given directly or from an intrinsic
+                     value estimate (margin of safety)
+  5. Solo Kelly    : per name over a buy-and-hold horizon versus cash. Your
+                     scenarios where you have a view; otherwise CAPM (expected
+                     return Rf + beta * MRP, lognormal with historical vol)
+  6. Portfolio     : joint weights maximizing expected log wealth over
+                     correlated scenarios (Thorp's "joint properties" rule)
+  7. Journal       : dated views + recorded outcomes -> calibration of your
+                     probabilities
 
-Kelly (continuous / Merton form):  f* = (E[R] - Rf) / sigma^2
-With CAPM E[R] = Rf + beta * MRP, this reduces to  f* = beta * MRP / sigma^2.
+Kelly: maximize E[log wealth]. For one win/lose bet this is the book's
+(bp - q) / b; here it is solved for any outcome mix and for the basket.
 """
 
 from __future__ import annotations
@@ -46,23 +47,13 @@ BETA_YEARS = 5           # lookback for beta (matches Yahoo's 5y-monthly convent
 MIN_MONTHS = 60          # require 5y of history, same rule as the original
 CHUNK = 100              # tickers per bulk download request
 
-# hist_cagr minus volatility-adjusted CAPM CAGR, in annual decimal terms.
-# (upper_bound_exclusive, label), checked in order.
-PERFORMANCE_BUCKETS = [
-    (-0.06, "Strong underperformer"),
-    (-0.02, "Underperformer"),
-    (0.02, "In line"),
-    (0.06, "Outperformer"),
-    (np.inf, "Strong outperformer"),
-]
-
 # Portfolio (multi-asset) Kelly defaults
 PORTFOLIO_MAX_WEIGHT = 0.25   # per-name cap on the full-Kelly book
 PORTFOLIO_MAX_LEVERAGE = 1.0  # sum of weights; 1.0 = no margin
 COV_SHRINK = 0.20             # blend sample covariance toward its diagonal
 
-# Views mode (Concentrated Investing: edge from your own research)
-DEFAULT_HORIZON = 3.0         # years for a thesis to play out
+# Horizon engine (Concentrated Investing: buy and hold, edge from research)
+DEFAULT_HORIZON = 3.0         # years for a thesis to play out (also CAPM names)
 N_SCENARIOS = 20_000          # joint outcomes simulated for expected-log Kelly
 VIEW_MIN_MONTHS = 12          # min shared months to estimate a correlation
 SCENARIO_SEED = 7             # fixed so reruns give identical weights
@@ -173,21 +164,42 @@ def download_monthly_closes(tickers: list[str], years: int,
     return prices.sort_index()
 
 
-# ----------------------------------------------------------------- math ---
-def categorize_gap(gap: float) -> str:
-    for bound, label in PERFORMANCE_BUCKETS:
-        if gap < bound:
-            return label
-    return PERFORMANCE_BUCKETS[-1][1]
+
+def download_latest_prices(tickers: list[str]) -> dict[str, float]:
+    """Most recent daily close per ticker (for margin of safety vs. value)."""
+    import yfinance as yf
+
+    if not tickers:
+        return {}
+    try:
+        raw = yf.download(list(tickers), period="5d", interval="1d",
+                          auto_adjust=True, group_by="column", threads=True,
+                          progress=False)
+        close = raw["Close"]
+        if isinstance(close, pd.Series):
+            close = close.to_frame(tickers[0])
+        last = close.ffill().iloc[-1].dropna()
+        return {k: float(v) for k, v in last.items()}
+    except Exception as e:
+        log(f"Latest prices failed ({e}); using last month-end closes")
+        return {}
 
 
 # ---------------------------------------------------------------- views ---
-VIEW_COLS = ["p_win", "upside", "downside"]
-
+# A view is up to three outcomes for a thesis over the horizon:
+#   bear : PERMANENT loss of capital (the book's definition of risk), prob p_bear
+#   base : optional middle case, prob p_base
+#   bull : the thesis plays out, prob p_bull = 1 - p_bear - p_base
+# The bull return can be given directly or derived from an intrinsic value
+# estimate: bull = value / price - 1 (margin of safety = 1 - price / value).
+VIEW_COLS = ["p_bear", "bear", "p_base", "base", "bull", "value"]
+LEGACY_VIEW_COLS = ["p_win", "upside", "downside"]
 
 # A column is read as percents if any plain number in it exceeds this
-# (p_win, downside: 1; upside can legitimately be >100%, e.g. 1.5 = +150%).
-_PCT_THRESHOLD = {"p_win": 1.0, "upside": 10.0, "downside": 1.0}
+# (probabilities and bear loss: 1; returns can legitimately exceed 100%).
+_PCT_THRESHOLD = {"p_bear": 1.0, "p_base": 1.0, "p_bull": 1.0, "bear": 1.0,
+                  "base": 10.0, "bull": 10.0,
+                  "p_win": 1.0, "upside": 10.0, "downside": 1.0}
 
 
 def _column_to_fraction(col: pd.Series, name: str) -> pd.Series:
@@ -196,7 +208,7 @@ def _column_to_fraction(col: pd.Series, name: str) -> pd.Series:
     column is read consistently: all percents if any value exceeds the
     threshold for that column (60 -> 0.60), else all decimals (0.6 -> 0.60).
     """
-    txt = col.astype(str).str.strip()
+    txt = col.astype(str).str.strip().replace({"nan": "", "None": "", "<NA>": ""})
     has_pct = txt.str.endswith("%")
     num = pd.to_numeric(txt.str.rstrip("%"), errors="coerce")
     plain = num[~has_pct].dropna()
@@ -209,69 +221,153 @@ def _column_to_fraction(col: pd.Series, name: str) -> pd.Series:
 
 def normalize_views(df: pd.DataFrame | None) -> pd.DataFrame:
     """
-    Clean a views table to index=ticker, columns p_win/upside/downside as
-    fractions. Rows missing any of the three are ignored (that name uses CAPM).
-
-      p_win    : probability the thesis plays out over the horizon (0-1)
-      upside   : gain if it does, e.g. 0.60 for +60%
-      downside : PERMANENT loss if it doesn't, e.g. 0.30 for -30% (0-1]
+    Clean a views table to index=ticker with VIEW_COLS (+ p_bull, notes).
+    Accepts the scenario format (p_bear, bear, [p_base, base], bull and/or
+    value) or the older binary format (p_win, upside, downside). Rows without
+    a usable bear case and a bull return or value are ignored (CAPM is used).
     """
-    empty = pd.DataFrame(columns=VIEW_COLS + ["notes"]).rename_axis("ticker")
+    cols = VIEW_COLS + ["p_bull", "notes"]
+    empty = pd.DataFrame(columns=cols).rename_axis("ticker")
     if df is None or df.empty:
         return empty
     d = df.copy()
     if d.index.name == "ticker" and "ticker" not in d.columns:
         d = d.reset_index()                      # already normalized: idempotent
     d.columns = [str(c).strip().lower() for c in d.columns]
-    if "ticker" not in d.columns or not set(VIEW_COLS) <= set(d.columns):
-        raise ValueError("Views need columns: ticker, p_win, upside, downside")
+    if "ticker" not in d.columns:
+        raise ValueError("Views need a ticker column")
     d["ticker"] = d["ticker"].astype(str).map(_yahoo_symbol).str.upper()
+
+    legacy = set(LEGACY_VIEW_COLS) <= set(d.columns) and "p_bear" not in d.columns
+    if not legacy and not {"p_bear", "bear"} <= set(d.columns):
+        raise ValueError("Views need p_bear and bear (or the older p_win, upside, downside)")
+    if legacy:
+        for c in LEGACY_VIEW_COLS:
+            d[c] = _column_to_fraction(d[c], c)
+        d["p_bear"] = 1 - d["p_win"]
+        d["bear"] = d["downside"]
+        d["bull"] = d["upside"]
     for c in VIEW_COLS:
+        if c not in d.columns:
+            d[c] = np.nan
+    for c in ["p_bear", "bear", "p_base", "base", "bull"]:
         d[c] = _column_to_fraction(d[c], c)
-    d["downside"] = d["downside"].abs()
-    d = d.dropna(subset=VIEW_COLS)
-    bad = d[(d.p_win <= 0) | (d.p_win >= 1) | (d.upside <= 0)
-            | (d.downside <= 0) | (d.downside > 1)]
+    d["value"] = pd.to_numeric(d["value"].astype(str).str.replace(r"[$,]", "", regex=True),
+                               errors="coerce")
+    d["bear"] = d["bear"].abs()
+    d["p_base"] = d["p_base"].fillna(0.0)
+    d.loc[d["p_base"] == 0, "base"] = np.nan
+
+    d = d.dropna(subset=["p_bear", "bear"])
+    d = d[d["bull"].notna() | d["value"].notna()]
+    d["p_bull"] = 1 - d["p_bear"] - d["p_base"]
+
+    bad = d[(d.p_bear <= 0) | (d.p_bear >= 1) | (d.bear <= 0) | (d.bear > 1)
+            | (d.p_base < 0) | (d.p_bull <= 0)
+            | ((d.p_base > 0) & (d.base.isna() | (d.base <= -1)))
+            | (d.bull.notna() & (d.bull <= 0)) | (d.value.notna() & (d.value <= 0))]
     if not bad.empty:
-        raise ValueError("Invalid views (need 0<p_win<1, upside>0, 0<downside<=1): "
-                         + ", ".join(bad["ticker"]))
-    tiny = d[d.upside < 0.02]
+        raise ValueError(
+            "Invalid views for " + ", ".join(bad["ticker"]) + ". Need 0 < bear odds < 1, "
+            "0 < bear loss <= 100%, bear + base odds < 100%, a base return when base "
+            "odds are set, and a positive bull return or value.")
+    tiny = d[d.bull.notna() & (d.bull < 0.02)]
     if not tiny.empty:
-        log("Views: upside under 2% for " + ", ".join(tiny["ticker"])
+        log("Views: bull return under 2% for " + ", ".join(tiny["ticker"])
             + " - check units (use 1.5 or 150 for +150%)")
     if "notes" not in d.columns:
         d["notes"] = ""
-    return d.drop_duplicates("ticker", keep="last").set_index("ticker")[VIEW_COLS + ["notes"]]
+    d["notes"] = d["notes"].fillna("")
+    return d.drop_duplicates("ticker", keep="last").set_index("ticker")[cols]
 
 
 def load_views(path: Path | str) -> pd.DataFrame:
     return normalize_views(pd.read_csv(path))
 
 
+def resolve_views(views: pd.DataFrame, prices_now: dict[str, float]) -> pd.DataFrame:
+    """
+    Attach the current price, derive the bull return from intrinsic value
+    where it wasn't given, and compute margin of safety (1 - price / value).
+    Views that need a price to work but have none are dropped with a note.
+    """
+    v = normalize_views(views).copy()
+    v["price"] = [prices_now.get(t, np.nan) for t in v.index]
+    v["margin_of_safety"] = 1 - v["price"] / v["value"]
+    need = v["bull"].isna()
+    v.loc[need, "bull"] = v.loc[need, "value"] / v.loc[need, "price"] - 1
+    unusable = v[v["bull"].isna() | (v["bull"] <= 0)]
+    for t, r in unusable.iterrows():
+        why = ("no current price to compare with its value" if pd.isna(r["price"])
+               else f"value ${r['value']:,.2f} is below the price ${r['price']:,.2f}: no upside")
+        log(f"Views: ignoring {t} ({why}); it falls back to CAPM")
+    return v.drop(index=unusable.index)
+
+
+def view_outcomes(v: pd.Series) -> tuple[np.ndarray, np.ndarray]:
+    """(probabilities, horizon returns), ordered bear -> base -> bull."""
+    probs, rets = [v["p_bear"]], [-v["bear"]]
+    if v["p_base"] > 0:
+        probs.append(v["p_base"]); rets.append(v["base"])
+    probs.append(v["p_bull"]); rets.append(v["bull"])
+    return np.array(probs, float), np.array(rets, float)
+
+
 def binary_kelly(p: float, upside: float, downside: float, rf_h: float) -> float:
     """
-    Exact Kelly fraction for one bet that returns +upside with prob p or
-    -downside with prob 1-p, versus cash earning rf_h over the same horizon.
-
+    Closed-form Kelly for one win/lose bet against cash over the horizon:
         f* = (1 + rf) * ( p / (downside + rf) - q / (upside - rf) )
-
-    With rf = 0 this is p/a - q/b; with a total-loss downside it is the
-    book's (bp - q) / b. Negative means "no edge, don't bet" (floored at 0).
+    With rf = 0 and a total-loss downside it is the book's (bp - q) / b.
+    Kept as a reference; discrete_kelly() solves the general case.
     """
     q = 1 - p
     if upside <= rf_h:
         return 0.0
-    f = (1 + rf_h) * (p / (downside + rf_h) - q / (upside - rf_h))
-    return max(f, 0.0)
+    return max((1 + rf_h) * (p / (downside + rf_h) - q / (upside - rf_h)), 0.0)
+
+
+def discrete_kelly(probs: np.ndarray, rets: np.ndarray, rf_h: float,
+                   cap: float = 10.0) -> float:
+    """
+    Kelly fraction for one bet with any number of outcomes, versus cash at
+    rf_h: maximize sum p * log(1 + rf + f (r - rf)). Concave, so no edge
+    (expected return <= rf) means zero. The fraction is kept below the point
+    where the worst outcome would wipe out the bankroll: never risks ruin.
+    """
+    from scipy.optimize import minimize_scalar
+
+    x = rets - rf_h
+    if probs @ x <= 0:
+        return 0.0
+    worst = x.min()
+    f_ruin = (1 + rf_h) / -worst if worst < 0 else np.inf
+    hi = min(cap, f_ruin * (1 - 1e-9))
+    obj = lambda f: -(probs @ np.log(1 + rf_h + f * x))
+    res = minimize_scalar(obj, bounds=(0.0, hi), method="bounded",
+                          options={"xatol": 1e-10})
+    return float(res.x)
+
+
+def lognormal_outcomes(expected_return: float, vol: float, horizon: float,
+                       nodes: int = 41) -> tuple[np.ndarray, np.ndarray]:
+    """CAPM name over the horizon as a lognormal, discretized with
+    Gauss-Hermite quadrature (deterministic, accurate to many decimals)."""
+    x, w = np.polynomial.hermite_e.hermegauss(nodes)
+    w = w / w.sum()
+    mu_log = np.log1p(expected_return) - vol ** 2 / 2
+    return w, np.expm1(mu_log * horizon + vol * np.sqrt(horizon) * x)
 
 
 def view_stats(v: pd.Series, rf: float, horizon: float) -> dict:
     rf_h = (1 + rf) ** horizon - 1
-    exp_h = v.p_win * v.upside - (1 - v.p_win) * v.downside
-    f = binary_kelly(v.p_win, v.upside, v.downside, rf_h)
+    probs, rets = view_outcomes(v)
+    exp_h = float(probs @ rets)
+    f = discrete_kelly(probs, rets, rf_h)
     return {
         "edge_source": "views",
-        "p_win": v.p_win, "upside": v.upside, "downside": v.downside,
+        **{c: v.get(c, np.nan) for c in
+           ["p_bear", "bear", "p_base", "base", "p_bull", "bull", "value",
+            "price", "margin_of_safety"]},
         "horizon_years": horizon,
         "view_expected_return": exp_h,
         "view_annualized_return": (1 + exp_h) ** (1 / horizon) - 1 if exp_h > -1 else -1.0,
@@ -283,14 +379,23 @@ def view_stats(v: pd.Series, rf: float, horizon: float) -> dict:
 def compute_kelly(prices: pd.DataFrame, rf: float, market_return: float,
                   benchmark: str = BENCHMARK,
                   views: pd.DataFrame | None = None,
-                  horizon: float = DEFAULT_HORIZON) -> pd.DataFrame:
+                  horizon: float = DEFAULT_HORIZON,
+                  prices_now: dict[str, float] | None = None) -> pd.DataFrame:
     """
-    Per-name stats. CAPM supplies the edge by default; a name with a view
-    gets its Kelly columns from your view instead (edge_source = 'views'),
-    keeping the CAPM figure in capm_full_kelly for comparison. Names with a
-    view are kept even with short price history.
+    Per-name solo Kelly over the horizon (buy and hold, versus cash).
+
+    CAPM supplies the edge by default: expected return = Rf + beta * MRP,
+    outcomes lognormal with historical volatility. A name with a view uses
+    your scenarios instead (edge_source = 'views'); its CAPM figure stays in
+    capm_full_kelly for comparison. Names with a view are kept even with
+    short price history. prices_now (latest prices) is needed only for views
+    given as intrinsic value; it falls back to the last month-end close.
     """
     views = normalize_views(views) if views is not None else normalize_views(None)
+    if len(views):
+        last_close = prices.ffill().iloc[-1].to_dict() if len(prices) else {}
+        views = resolve_views(views, {**last_close, **(prices_now or {})})
+    rf_h = (1 + rf) ** horizon - 1
     mrp = market_return - rf
     rets = prices.pct_change(fill_method=None)
     beta_window = rets.iloc[-BETA_YEARS * 12:]
@@ -317,11 +422,7 @@ def compute_kelly(prices: pd.DataFrame, rf: float, market_return: float,
         var_annual = r.var() * 12
         vol_annual = np.sqrt(var_annual)
         exp_ret = rf + beta * mrp
-        kelly = (exp_ret - rf) / var_annual if var_annual > 0 else np.nan
-        hist_cagr = (1 + r).prod() ** (12 / len(r)) - 1
-        # CAPM gives an arithmetic mean; compounding loses ~variance/2 a year.
-        expected_cagr = exp_ret - var_annual / 2
-        cagr_gap = hist_cagr - expected_cagr
+        kelly = discrete_kelly(*lognormal_outcomes(exp_ret, vol_annual, horizon), rf_h)
 
         row = {
             "ticker": t,
@@ -330,12 +431,9 @@ def compute_kelly(prices: pd.DataFrame, rf: float, market_return: float,
             "expected_return": exp_ret,
             "annual_variance": var_annual,
             "annual_volatility": vol_annual,
-            "sharpe_capm": (exp_ret - rf) / vol_annual,
-            "hist_cagr": hist_cagr,
-            "expected_cagr": expected_cagr,
-            "cagr_gap": cagr_gap,
-            "performance_category": categorize_gap(cagr_gap),
+            "hist_cagr": (1 + r).prod() ** (12 / len(r)) - 1,
             "months_of_data": len(r),
+            "horizon_years": horizon,
             "capm_full_kelly": kelly,
             "full_kelly": kelly,
             "half_kelly": kelly / 2,
@@ -349,6 +447,7 @@ def compute_kelly(prices: pd.DataFrame, rf: float, market_return: float,
     return pd.DataFrame(rows)
 
 
+# ------------------------------------------------------------ portfolio ---
 FRACTIONS = {"full": 1.0, "half": 0.5, "quarter": 0.25, "eighth": 0.125}
 
 
@@ -363,6 +462,55 @@ def _basket_filter(results: pd.DataFrame, basket: list[str]) -> tuple[pd.DataFra
     if len(basket) < 2:
         raise ValueError("Portfolio needs at least 2 tickers with valid data.")
     return ok, basket
+
+
+def _correlation(prices: pd.DataFrame, basket: list[str], shrink: float) -> tuple[np.ndarray, int]:
+    """Pairwise correlations of monthly returns (each pair uses the months it
+    shares, min VIEW_MIN_MONTHS; otherwise 0), shrunk toward independence and
+    repaired to be positive semi-definite."""
+    rets = prices[basket].pct_change(fill_method=None)
+    corr = rets.corr(min_periods=VIEW_MIN_MONTHS).fillna(0.0).to_numpy(copy=True)
+    np.fill_diagonal(corr, 1.0)
+    corr = (1 - shrink) * corr + shrink * np.eye(len(basket))
+    vals, vecs = np.linalg.eigh(corr)
+    corr = vecs @ np.diag(np.clip(vals, 1e-8, None)) @ vecs.T
+    d = np.sqrt(np.diag(corr))
+    corr = corr / np.outer(d, d)
+    for t in basket:
+        if rets[t].notna().sum() < VIEW_MIN_MONTHS:
+            log(f"Portfolio: {t} has <{VIEW_MIN_MONTHS} months of prices; "
+                f"treated as uncorrelated with the rest")
+    return corr, int(rets.dropna(how="all").shape[0])
+
+
+def simulate_outcomes(ok: pd.DataFrame, basket: list[str], corr: np.ndarray,
+                      horizon: float, n_scenarios: int = N_SCENARIOS,
+                      seed: int = SCENARIO_SEED) -> np.ndarray:
+    """
+    Joint horizon returns, shape (n_scenarios, n_names), via a Gaussian copula
+    on historical correlations:
+      - name with a view : bear / base / bull with your probabilities, ordered
+                           so correlated names tend to land on the same side
+      - name without one : lognormal with CAPM mean and historical volatility
+    """
+    from scipy.stats import norm
+
+    rng = np.random.default_rng(seed)
+    L = np.linalg.cholesky(corr)
+    z = rng.standard_normal((n_scenarios, len(basket))) @ L.T
+    u = norm.cdf(z)
+    out = np.empty_like(z)
+    for j, t in enumerate(basket):
+        row = ok.loc[t]
+        if row.get("edge_source") == "views":
+            probs, rets = view_outcomes(row)
+            idx = np.searchsorted(np.cumsum(probs)[:-1], u[:, j], side="right")
+            out[:, j] = rets[idx]
+        else:
+            vol = row["annual_volatility"]
+            mu_log = np.log1p(row["expected_return"]) - vol ** 2 / 2
+            out[:, j] = np.expm1(mu_log * horizon + vol * np.sqrt(horizon) * z[:, j])
+    return out
 
 
 def _solve(neg_obj, neg_grad, n: int, max_weight: float, max_leverage: float):
@@ -381,174 +529,6 @@ def _solve(neg_obj, neg_grad, n: int, max_weight: float, max_leverage: float):
     return w, bool(res.success)
 
 
-def _assemble(ok: pd.DataFrame, basket: list[str], weights: dict,
-              summary: list[dict], extra: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
-    out = pd.DataFrame({"ticker": basket, **weights})
-    meta_cols = ["name", "sector", "universe", "edge_source", "p_win", "upside",
-                 "downside", "beta", "annual_volatility", "expected_return",
-                 "full_kelly"]
-    meta_cols = [c for c in meta_cols if c in ok.columns]
-    out = out.merge(ok.loc[basket, meta_cols].reset_index(), on="ticker")
-    out = out.rename(columns={"full_kelly": "standalone_full_kelly"})
-    out = out.sort_values("weight_full_kelly", ascending=False)
-    cash = {"ticker": "CASH", **{k: 1 - v.sum() for k, v in weights.items()}}
-    out = pd.concat([out, pd.DataFrame([cash])], ignore_index=True)
-    summ = pd.DataFrame(summary)
-    for i, (k, v) in enumerate(extra.items(), start=1):
-        summ.insert(i, k, v)
-    return out, summ
-
-
-def _portfolio_kelly_capm(prices, ok, basket, rf, max_weight, max_leverage, shrink):
-    """
-    Continuous (Merton) Kelly on CAPM inputs, rebalanced:
-        maximize  w'(mu - rf) - (1 / 2c) * w' Sigma w
-    solved separately for each Kelly fraction c (uncapped, this equals
-    scaling full Kelly by c). Sigma: annualized covariance over the months
-    all names share, shrunk toward its diagonal.
-    """
-    from scipy.stats import norm
-
-    rets = prices[basket].pct_change(fill_method=None).dropna()
-    shortest = prices[basket].notna().sum().idxmin()
-    log(f"Portfolio: {len(rets)} overlapping months (limited by {shortest})")
-    if len(rets) < MIN_MONTHS:
-        raise ValueError(f"Only {len(rets)} months of overlapping history "
-                         f"across the basket (need {MIN_MONTHS}).")
-    sample = rets.cov().values * 12
-    cov = (1 - shrink) * sample + shrink * np.diag(np.diag(sample))
-    excess = ok.loc[basket, "expected_return"].values - rf
-    n = len(basket)
-
-    weights, summary = {}, []
-    for label, c in FRACTIONS.items():
-        w, success = _solve(
-            lambda w, c=c: -(w @ excess - 0.5 / c * w @ cov @ w),
-            lambda w, c=c: -(excess - (1 / c) * cov @ w),
-            n, max_weight, max_leverage)
-        weights[f"weight_{label}_kelly"] = w
-        port_excess, port_var = w @ excess, w @ cov @ w
-        vol = np.sqrt(port_var)
-        g = rf + port_excess - 0.5 * port_var          # log growth / yr
-        summary.append({
-            "kelly_fraction": label,
-            "invested": w.sum(), "cash": 1 - w.sum(),
-            "holdings": int((w > 0).sum()),
-            "expected_return": rf + port_excess,
-            "volatility": vol,
-            "sharpe": port_excess / vol if vol > 0 else np.nan,
-            "expected_growth_rate": g,
-            # 1-year horizon, lognormal approximation
-            "prob_loss": float(norm.cdf(-g / vol)) if vol > 0 else 0.0,
-            "worst_5pct": float(np.expm1(g + norm.ppf(0.05) * vol)),
-            "solver_ok": success,
-        })
-    return _assemble(ok, basket, weights, summary,
-                     {"engine": "CAPM", "basket_size": n,
-                      "months_used": len(rets), "horizon_years": 1.0})
-
-
-def _correlation(prices: pd.DataFrame, basket: list[str], shrink: float) -> tuple[np.ndarray, int]:
-    """Pairwise correlations of monthly returns (each pair uses the months it
-    shares, min VIEW_MIN_MONTHS; otherwise 0), shrunk toward independence and
-    repaired to be positive semi-definite."""
-    rets = prices[basket].pct_change(fill_method=None)
-    corr = rets.corr(min_periods=VIEW_MIN_MONTHS).fillna(0.0).to_numpy(copy=True)
-    np.fill_diagonal(corr, 1.0)
-    corr = (1 - shrink) * corr + shrink * np.eye(len(basket))
-    vals, vecs = np.linalg.eigh(corr)
-    corr = vecs @ np.diag(np.clip(vals, 1e-8, None)) @ vecs.T
-    d = np.sqrt(np.diag(corr))
-    corr = corr / np.outer(d, d)
-    missing = [t for t in basket
-               if rets[t].notna().sum() < VIEW_MIN_MONTHS]
-    for t in missing:
-        log(f"Portfolio: {t} has <{VIEW_MIN_MONTHS} months of prices; "
-            f"treated as uncorrelated with the rest")
-    return corr, int(rets.dropna(how="all").shape[0])
-
-
-def simulate_outcomes(ok: pd.DataFrame, basket: list[str], corr: np.ndarray,
-                      horizon: float, n_scenarios: int = N_SCENARIOS,
-                      seed: int = SCENARIO_SEED) -> np.ndarray:
-    """
-    Joint horizon returns, shape (n_scenarios, n_names), via a Gaussian copula
-    on historical correlations:
-      - name with a view : +upside with prob p_win, else -downside (permanent)
-      - name without one : lognormal with CAPM mean and historical volatility
-    """
-    from scipy.stats import norm
-
-    rng = np.random.default_rng(seed)
-    L = np.linalg.cholesky(corr)
-    z = rng.standard_normal((n_scenarios, len(basket))) @ L.T
-    out = np.empty_like(z)
-    for j, t in enumerate(basket):
-        row = ok.loc[t]
-        if row.get("edge_source") == "views":
-            win = norm.cdf(z[:, j]) > 1 - row["p_win"]
-            out[:, j] = np.where(win, row["upside"], -row["downside"])
-        else:
-            vol = row["annual_volatility"]
-            mu_log = np.log1p(row["expected_return"]) - vol ** 2 / 2
-            out[:, j] = np.expm1(mu_log * horizon + vol * np.sqrt(horizon) * z[:, j])
-    return out
-
-
-def _portfolio_kelly_views(prices, ok, basket, rf, max_weight, max_leverage,
-                           shrink, horizon, n_scenarios):
-    """
-    Kelly as the book defines it: maximize the expected LOG of wealth at the
-    thesis horizon over the joint outcomes of all positions at once (Thorp's
-    "joint properties" rule), long-only, no more than max_leverage invested.
-    A position whose loss could wipe out the portfolio gets log(0) = -inf, so
-    the solution never risks ruin. Fractional Kelly = the full-Kelly bets
-    scaled by c (half Kelly = bet half).
-    """
-    corr, months = _correlation(prices, basket, shrink)
-    R = simulate_outcomes(ok, basket, corr, horizon, n_scenarios)
-    rf_h = (1 + rf) ** horizon - 1
-    X = R - rf_h
-    n = len(basket)
-
-    def neg_obj(w):
-        W = np.maximum(1 + rf_h + X @ w, 1e-12)
-        return -np.mean(np.log(W))
-
-    def neg_grad(w):
-        W = np.maximum(1 + rf_h + X @ w, 1e-12)
-        return -(X / W[:, None]).mean(axis=0)
-
-    w_full, success = _solve(neg_obj, neg_grad, n, max_weight, max_leverage)
-
-    weights, summary = {}, []
-    for label, c in FRACTIONS.items():
-        w = w_full * c
-        weights[f"weight_{label}_kelly"] = w
-        W = 1 + rf_h + X @ w
-        logW = np.log(np.maximum(W, 1e-12))
-        exp_ann = np.mean(W) ** (1 / horizon) - 1
-        vol = np.std(logW) / np.sqrt(horizon)
-        summary.append({
-            "kelly_fraction": label,
-            "invested": w.sum(), "cash": 1 - w.sum(),
-            "holdings": int((w > 0).sum()),
-            "expected_return": exp_ann,
-            "volatility": vol,
-            "sharpe": (exp_ann - rf) / vol if vol > 0 else np.nan,
-            "expected_growth_rate": np.expm1(np.mean(logW) / horizon),
-            "prob_loss": float(np.mean(W < 1)),
-            "worst_5pct": float(np.quantile(W, 0.05) - 1),
-            "solver_ok": success,
-        })
-    n_views = int((ok.loc[basket, "edge_source"] == "views").sum())
-    log(f"Portfolio: views mode, {n_views} of {n} names with views, "
-        f"{horizon:g}-year horizon, {n_scenarios:,} scenarios")
-    return _assemble(ok, basket, weights, summary,
-                     {"engine": "views", "basket_size": n,
-                      "months_used": months, "horizon_years": horizon})
-
-
 def portfolio_kelly(prices: pd.DataFrame, results: pd.DataFrame,
                     basket: list[str], rf: float,
                     max_weight: float = PORTFOLIO_MAX_WEIGHT,
@@ -558,18 +538,191 @@ def portfolio_kelly(prices: pd.DataFrame, results: pd.DataFrame,
                     n_scenarios: int = N_SCENARIOS,
                     ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Joint Kelly weights for a basket. If any name carries a view, uses the
-    views engine (expected log wealth over correlated scenarios at the thesis
-    horizon); otherwise the continuous CAPM engine. Returns (weights, summary).
+    Kelly as the book defines it: choose the basket's weights to maximize the
+    expected LOG of wealth at the horizon, over the joint outcomes of every
+    position at once (Thorp's "joint properties" rule). Buy and hold for the
+    horizon, long only, at most max_leverage invested; the rest earns the
+    risk-free rate. Any mix that could wipe out the portfolio scores log(0)
+    = -inf, so the result never risks ruin. Fractional Kelly = the full-Kelly
+    bet scaled by c (half Kelly = bet half), then capped by your position
+    limits. Returns (weights, summary).
     """
     ok, basket = _basket_filter(results, basket)
-    has_views = ("edge_source" in ok.columns
-                 and (ok.loc[basket, "edge_source"] == "views").any())
-    if has_views:
-        return _portfolio_kelly_views(prices, ok, basket, rf, max_weight,
-                                      max_leverage, shrink, horizon, n_scenarios)
-    return _portfolio_kelly_capm(prices, ok, basket, rf, max_weight,
-                                 max_leverage, shrink)
+    corr, months = _correlation(prices, basket, shrink)
+    R = simulate_outcomes(ok, basket, corr, horizon, n_scenarios)
+    rf_h = (1 + rf) ** horizon - 1
+    X = R - rf_h
+    n = len(basket)
+
+    def neg_obj(w):
+        return -np.mean(np.log(np.maximum(1 + rf_h + X @ w, 1e-12)))
+
+    def neg_grad(w):
+        W = np.maximum(1 + rf_h + X @ w, 1e-12)
+        return -(X / W[:, None]).mean(axis=0)
+
+    # Fractional Kelly c means "bet c times what Kelly says", then apply your
+    # position limits. Solve for the Kelly bet u with limits scaled by 1/c,
+    # and hold w = c * u. Uncapped this is exactly c * full Kelly; when a cap
+    # binds, half Kelly is half the Kelly bet trimmed to the cap, not half of
+    # an already-capped bet.
+    weights, summary = {}, []
+    for label, c in FRACTIONS.items():
+        u, success = _solve(neg_obj, neg_grad, n, max_weight / c, max_leverage / c)
+        w = c * u
+        w[w < 1e-5] = 0.0
+        weights[f"weight_{label}_kelly"] = w
+        W = 1 + rf_h + X @ w
+        logW = np.log(np.maximum(W, 1e-12))
+        summary.append({
+            "kelly_fraction": label,
+            "invested": w.sum(), "cash": 1 - w.sum(),
+            "holdings": int((w > 0).sum()),
+            "prob_loss": float(np.mean(W < 1)),
+            "worst_5pct": float(np.quantile(W, 0.05) - 1),
+            "expected_growth_rate": np.expm1(np.mean(logW) / horizon),
+            "expected_return": np.mean(W) ** (1 / horizon) - 1,
+            "volatility": np.std(logW) / np.sqrt(horizon),
+            "solver_ok": success,
+        })
+    n_views = int((ok.loc[basket, "edge_source"] == "views").sum())
+    log(f"Portfolio: {n_views} of {n} names sized on your views, the rest on CAPM; "
+        f"{horizon:g}-year horizon, {n_scenarios:,} scenarios")
+
+    out = pd.DataFrame({"ticker": basket, **weights})
+    meta_cols = ["name", "sector", "universe", "edge_source", "p_bear", "bear",
+                 "p_base", "base", "p_bull", "bull", "value", "price",
+                 "margin_of_safety", "beta", "annual_volatility", "expected_return",
+                 "full_kelly"]
+    meta_cols = [c for c in meta_cols if c in ok.columns]
+    out = out.merge(ok.loc[basket, meta_cols].reset_index(), on="ticker")
+    out = out.rename(columns={"full_kelly": "standalone_full_kelly"})
+    out = out.sort_values(["weight_full_kelly", "ticker"], ascending=[False, True])
+    cash = {"ticker": "CASH", **{k: 1 - v.sum() for k, v in weights.items()}}
+    out = pd.concat([out, pd.DataFrame([cash])], ignore_index=True)
+    summ = pd.DataFrame(summary)
+    summ.insert(1, "views_used", n_views)
+    summ.insert(2, "basket_size", n)
+    summ.insert(3, "months_used", months)
+    summ.insert(4, "horizon_years", horizon)
+    return out, summ
+
+
+# -------------------------------------------------------------- journal ---
+# Kelly is only as good as your probabilities. The journal records each view
+# with the date and entry price; later you record which scenario actually
+# played out (judge the thesis, not the price: a drop isn't a permanent loss).
+# Calibration then shows whether your 60% calls come true about 60% of the time.
+JOURNAL_COLS = ["date", "ticker", "horizon_years", "entry_price", "value",
+                "p_bear", "bear", "p_base", "base", "p_bull", "bull",
+                "notes", "outcome", "outcome_date"]
+OUTCOMES = ["bear", "base", "bull"]
+
+
+def normalize_journal(df: pd.DataFrame | None) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=JOURNAL_COLS)
+    j = df.copy()
+    j.columns = [str(c).strip().lower() for c in j.columns]
+    for c in JOURNAL_COLS:
+        if c not in j.columns:
+            j[c] = np.nan
+    j["ticker"] = j["ticker"].astype(str).map(_yahoo_symbol).str.upper()
+    j["date"] = pd.to_datetime(j["date"], errors="coerce").dt.date
+    j["outcome_date"] = pd.to_datetime(j["outcome_date"], errors="coerce").dt.date
+    j["outcome"] = (j["outcome"].astype(str).str.strip().str.lower()
+                    .where(lambda s: s.isin(OUTCOMES), ""))
+    num = ["horizon_years", "entry_price", "value", "p_bear", "bear", "p_base",
+           "base", "p_bull", "bull"]
+    j[num] = j[num].apply(pd.to_numeric, errors="coerce")
+    j["notes"] = j["notes"].fillna("").astype(str).replace("nan", "")
+    j[["p_bear", "bear", "p_base", "base", "p_bull", "bull"]] = (
+        j[["p_bear", "bear", "p_base", "base", "p_bull", "bull"]].round(6))
+    j[["entry_price", "value"]] = j[["entry_price", "value"]].round(4)
+    return j[JOURNAL_COLS].dropna(subset=["date"]).reset_index(drop=True)
+
+
+def load_journal(path: Path | str) -> pd.DataFrame:
+    p = Path(path)
+    return normalize_journal(pd.read_csv(p)) if p.exists() else normalize_journal(None)
+
+
+def journal_entries(resolved_views: pd.DataFrame, horizon: float,
+                    on: date | None = None) -> pd.DataFrame:
+    """Rows for today's views (output of resolve_views), ready to append."""
+    on = on or date.today()
+    v = resolved_views.reset_index()
+    rows = pd.DataFrame({
+        "date": on, "ticker": v["ticker"], "horizon_years": horizon,
+        "entry_price": v.get("price"), "value": v.get("value"),
+        **{c: v[c] for c in ["p_bear", "bear", "p_base", "base", "p_bull", "bull"]},
+        "notes": v.get("notes", ""), "outcome": "", "outcome_date": pd.NaT,
+    })
+    return normalize_journal(rows)
+
+
+def append_journal(journal: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
+    """Add entries; re-logging the same ticker on the same day replaces it."""
+    j = pd.concat([normalize_journal(journal), normalize_journal(new)], ignore_index=True)
+    return j.drop_duplicates(["date", "ticker"], keep="last").reset_index(drop=True)
+
+
+def journal_report(journal: pd.DataFrame, prices_now: dict[str, float] | None = None,
+                   today: date | None = None) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
+    """
+    Returns (entries with status and return since entry, summary dict,
+    calibration table by the bull probability you gave).
+
+    status: 'resolved' (outcome recorded), 'due' (horizon has passed, record
+    the outcome), or 'open'.
+    """
+    today = today or date.today()
+    j = normalize_journal(journal).copy()
+    prices_now = prices_now or {}
+    due_date = [d + pd.DateOffset(days=int(round(h * 365.25)))
+                if pd.notna(h) else pd.NaT
+                for d, h in zip(pd.to_datetime(j["date"]), j["horizon_years"])]
+    j["horizon_ends"] = pd.to_datetime(due_date).date if len(j) else []
+    j["status"] = np.where(j["outcome"] != "", "resolved",
+                           np.where(pd.to_datetime(j["horizon_ends"]) <= pd.Timestamp(today),
+                                    "due", "open"))
+    j["price_now"] = [prices_now.get(t, np.nan) for t in j["ticker"]]
+    j["return_since_entry"] = j["price_now"] / j["entry_price"] - 1
+    j["expected_return"] = (j["p_bear"] * -j["bear"] + j["p_base"].fillna(0) * j["base"].fillna(0)
+                            + j["p_bull"] * j["bull"])
+
+    res = j[j["status"] == "resolved"]
+    summary = {"entries": len(j), "resolved": len(res),
+               "due": int((j["status"] == "due").sum()),
+               "open": int((j["status"] == "open").sum())}
+    if len(res):
+        P = res[["p_bear", "p_base", "p_bull"]].fillna(0).to_numpy()
+        Y = np.stack([(res["outcome"] == o).to_numpy(float) for o in OUTCOMES], axis=1)
+        summary["brier"] = float(np.mean(np.sum((P - Y) ** 2, axis=1)))
+        summary["avg_prob_of_actual"] = float(np.mean(np.sum(P * Y, axis=1)))
+        for o, col in zip(OUTCOMES, ["p_bear", "p_base", "p_bull"]):
+            summary[f"predicted_{o}"] = float(res[col].fillna(0).mean())
+            summary[f"actual_{o}"] = float((res["outcome"] == o).mean())
+        gap = summary["predicted_bull"] - summary["actual_bull"]
+        summary["verdict"] = (
+            "Too few resolved calls to judge calibration yet (aim for 10+)."
+            if len(res) < 10 else
+            f"Your bull calls run hot: you predicted {summary['predicted_bull']:.0%}, "
+            f"{summary['actual_bull']:.0%} came true. Lower your odds or bet a smaller fraction."
+            if gap > 0.10 else
+            f"You're underconfident: {summary['actual_bull']:.0%} of bull calls came true "
+            f"vs {summary['predicted_bull']:.0%} predicted."
+            if gap < -0.10 else
+            "Well calibrated so far: your bull odds match how often they came true.")
+    bins = pd.cut(res["p_bull"], [0, 0.4, 0.6, 0.8, 1.0001],
+                  labels=["<40%", "40-60%", "60-80%", "80%+"], right=False)
+    calib = (res.assign(bucket=bins, hit=(res["outcome"] == "bull").astype(float))
+             .groupby("bucket", observed=True)
+             .agg(calls=("hit", "size"), predicted_bull=("p_bull", "mean"),
+                  actual_bull=("hit", "mean"))
+             .reset_index()) if len(res) else pd.DataFrame(
+        columns=["bucket", "calls", "predicted_bull", "actual_bull"])
+    return j, summary, calib
 
 
 # ------------------------------------------------------------------ main ---
@@ -609,7 +762,7 @@ def lookup_extra_meta(tickers: list[str]) -> pd.DataFrame:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Kelly Criterion screener for the S&P 500")
+    p = argparse.ArgumentParser(description="Kelly Criterion sizing after Concentrated Investing")
     p.add_argument("--tickers", nargs="+",
                    help="Run ONLY these tickers instead of the full index")
     p.add_argument("--extra", nargs="+", default=[],
@@ -632,14 +785,23 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--shrink", type=float, default=COV_SHRINK,
                    help=f"Covariance shrinkage toward diagonal, 0-1 (default {COV_SHRINK})")
 
-    v = p.add_argument_group("views mode (your own edge)")
+    v = p.add_argument_group("your views (edge from research)")
     v.add_argument("--views", type=Path,
-                   help="CSV with ticker,p_win,upside,downside[,notes]; see views.example.csv")
+                   help="CSV: ticker,p_bear,bear[,p_base,base],bull and/or value[,notes]; "
+                        "see views.example.csv")
     v.add_argument("--horizon", type=float, default=DEFAULT_HORIZON,
-                   help=f"Years for each thesis to play out (default {DEFAULT_HORIZON:g})")
+                   help=f"Buy-and-hold horizon in years (default {DEFAULT_HORIZON:g})")
     v.add_argument("--scenarios", type=int, default=N_SCENARIOS,
                    help=f"Simulated joint outcomes (default {N_SCENARIOS:,})")
+
+    jg = p.add_argument_group("conviction journal")
+    jg.add_argument("--journal", type=Path,
+                    help="Journal CSV: prints calibration and open calls")
+    jg.add_argument("--log", action="store_true",
+                    help="Append today's views (with entry price) to --journal")
     args = p.parse_args(argv)
+    if args.log and not (args.journal and args.views):
+        p.error("--log needs both --views and --journal")
 
     views = load_views(args.views) if args.views else normalize_views(None)
     if len(views):
@@ -675,9 +837,10 @@ def main(argv: list[str] | None = None) -> int:
         log("ERROR: no price data returned. Check network / try again later.")
         return 1
 
+    prices_now = download_latest_prices(list(views.index)) if len(views) else {}
     missing = sorted(set(tickers) - set(prices.columns))
     res = compute_kelly(prices, rf, args.market_return,
-                        views=views, horizon=args.horizon)
+                        views=views, horizon=args.horizon, prices_now=prices_now)
     if missing:
         res = pd.concat([res, pd.DataFrame({"ticker": missing,
                                             "status": "no price data"})])
@@ -691,7 +854,8 @@ def main(argv: list[str] | None = None) -> int:
     ok = res[res["status"] == "ok"]
     log(f"\nComputed {len(ok)} of {len(tickers)} tickers.")
     show = ["ticker", "edge_source", "sector", "beta", "annual_volatility",
-            "cagr_gap", "performance_category", "full_kelly", "half_kelly"]
+            "margin_of_safety", "full_kelly", "half_kelly"]
+    show = [c for c in show if c in ok.columns]
     with pd.option_context("display.float_format", "{:.3f}".format,
                            "display.width", 160):
         log("\nTop 20 by full Kelly:\n" + ok[show].head(20).to_string(index=False))
@@ -735,6 +899,32 @@ def main(argv: list[str] | None = None) -> int:
         if not summary["solver_ok"].all():
             log("WARNING: optimizer did not fully converge for some fractions.")
         log(f"\nSaved: {w_path}\nSaved: {s_path}")
+
+    # ---- conviction journal
+    if args.journal:
+        journal = load_journal(args.journal)
+        if args.log:
+            last = prices.ffill().iloc[-1].to_dict()
+            resolved = resolve_views(views, {**last, **prices_now})
+            journal = append_journal(journal, journal_entries(resolved, args.horizon))
+            args.journal.parent.mkdir(parents=True, exist_ok=True)
+            journal.to_csv(args.journal, index=False)
+            log(f"\nJournal: logged {len(resolved)} views to {args.journal}")
+        now = {**prices.ffill().iloc[-1].to_dict(),
+               **download_latest_prices(sorted(set(journal["ticker"])))}
+        entries, jsum, calib = journal_report(journal, now)
+        log(f"\nJournal: {jsum['entries']} calls · {jsum['resolved']} resolved · "
+            f"{jsum['due']} due for an outcome · {jsum['open']} open")
+        if jsum["resolved"]:
+            log(f"  Brier score {jsum['brier']:.3f} (0 = perfect; lower is better) · "
+                f"avg probability you gave to what happened {jsum['avg_prob_of_actual']:.0%}")
+            log(f"  {jsum['verdict']}")
+            with pd.option_context("display.float_format", "{:.2f}".format):
+                log(calib.to_string(index=False))
+        due = entries[entries["status"] == "due"]
+        if len(due):
+            log("  Due: record bear/base/bull in the outcome column for "
+                + ", ".join(f"{t} ({d})" for t, d in zip(due["ticker"], due["date"])))
     return 0
 
 
