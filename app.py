@@ -7,6 +7,9 @@ Deploy:        Streamlit Community Cloud -> point at this repo, main file app.py
 
 from __future__ import annotations
 
+import importlib
+import os
+
 import altair as alt
 import numpy as np
 import pandas as pd
@@ -15,6 +18,22 @@ import streamlit as st
 import kelly_sp500 as ks
 
 st.set_page_config(page_title="Kelly Sizer", page_icon="📐", layout="centered")
+
+
+@st.cache_resource
+def _engine_loaded() -> dict:
+    """Process-wide record of which kelly_sp500.py version is in memory."""
+    return {"mtime": os.path.getmtime(ks.__file__)}
+
+
+# Streamlit re-runs app.py when it changes but keeps already-imported modules.
+# After a merge, Cloud would pair the new app with the old engine in memory
+# (e.g. AttributeError: no attribute 'DEFAULT_HORIZON'), so reload it when the
+# file on disk is newer than what's loaded.
+_loaded, _mtime = _engine_loaded(), os.path.getmtime(ks.__file__)
+if _mtime != _loaded["mtime"] or not hasattr(ks, "DEFAULT_HORIZON"):
+    ks = importlib.reload(ks)
+    _loaded["mtime"] = _mtime
 
 FRACTIONS = {"Full": "full", "Half": "half", "Quarter": "quarter", "Eighth": "eighth"}
 DEFAULT_TICKERS = ["NVDA", "ASML", "AVGO", "MSFT", "VOO"]
