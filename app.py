@@ -281,6 +281,43 @@ if results_ready:
         },
     )
 
+    # ---- what if I'm wrong (shared with the CLI): Thorp's warning, p. 105
+    st.subheader("What if I'm wrong?")
+    wiw = ks.what_if_wrong(prices, tickers, rf, views, weights, frac, prices_now=prices_now,
+                           market_return=mkt_ret, horizon=horizon, max_weight=max_weight,
+                           max_leverage=max_lev, shrink=shrink)
+    if wiw is None:
+        st.caption("Add your research to see how sensitive the sizing is to your bear "
+                   "cases. CAPM names have no view to be wrong about.")
+    else:
+        by_name, held = wiw
+        fragile = (by_name.verdict == "Fragile").any()
+        (st.warning if fragile else st.success)(ks.what_if_message(by_name, held))
+        st.caption("Kelly is only as good as your bear case. Thorp: misjudging the downside "
+                   "means the computed bet is too big. Each column re-sizes the basket "
+                   "with every bear case worse than you entered.")
+        t = by_name.copy()
+        for c in t.columns[2:-1]:
+            t[c] = t[c] * 100
+        st.dataframe(
+            t, hide_index=True, width="stretch",
+            column_config={
+                "ticker": st.column_config.TextColumn("Ticker", pinned=True),
+                "edge": st.column_config.TextColumn("Edge"),
+                "mine": st.column_config.NumberColumn(f"{fraction_label} Kelly", format="%.1f%%"),
+                **{c: st.column_config.NumberColumn(c, format="%.1f%%") for c in t.columns[3:-1]},
+                "verdict": st.column_config.TextColumn(
+                    "Verdict", help="Robust: keeps 75%+ of its size under both stresses. "
+                                    "Sensitive: 40-75%. Fragile: under 40%."),
+            },
+        )
+        h = held.set_index("scenario")[["prob_loss", "worst_5pct", "expected_growth_rate"]]
+        h.columns = [f"Chance of loss ({horizon:g}y)", f"Worst 1-in-20 ({horizon:g}y)",
+                     "Exp. growth/yr"]
+        st.caption("Your basket as sized, if each stress turns out to be the truth:")
+        st.dataframe(h.rename_axis("If the truth is…").map(lambda x: f"{x:.1%}"),
+                     width="stretch")
+
     with st.expander("Compare all Kelly fractions"):
         wide, fstats = ks.fractions_table(weights, summary)
         st.dataframe(wide.map(lambda x: f"{x:.1%}"), width="stretch")

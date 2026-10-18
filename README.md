@@ -7,7 +7,7 @@ One engine, two ways in: a **phone app** for sizing on the couch and a **command
 ## The workflow
 1. **Pick a basket**: 2–15 names you're considering.
 2. **Add your research** (optional): for each name, a **bear** case (the *permanent* loss if you're wrong, and its odds), an optional **base** case, and a **bull** case, either entered directly or as your **intrinsic value** per share (margin of safety). Names without research use CAPM, which assumes no edge.
-3. **Size it**: joint Kelly weights for the whole basket over a buy-and-hold horizon, at the Kelly fraction you choose. Results lead with the book's risk (chance of loss, 1-in-20 worst case), then growth, invested, cash, and price swings.
+3. **Size it**: joint Kelly weights for the whole basket over a buy-and-hold horizon, at the Kelly fraction you choose. Results lead with the book's risk (chance of loss, 1-in-20 worst case), then growth, invested, cash, and price swings. A **What if I'm wrong?** check shows which bets depend on your bear case being right.
 4. **Log it** to the conviction journal. When each horizon ends, record which scenario played out. The journal tells you whether your probabilities are calibrated, which decides whether you've earned bigger fractions.
 
 ## Phone app
@@ -73,6 +73,16 @@ Bull odds = `1 − p_bear − p_base`. **Units:** use one style per file. The od
 
 Buy and hold, no rebalancing assumption. Seeds are fixed, so reruns are identical.
 
+## What if I'm wrong?
+Kelly is only as good as your bear case. A small miss moves the *edge* a lot, because edge is the small gap between your expected return and cash. Example: a view at 25% / −50% bear, 35% / +15% base, 40% / +100% bull over 3 years has an 18.6-point edge over cash. Make the bear case 35% likely and the edge falls to 3.6 points, and half Kelly drops from 30% to 6%. That's Thorp's warning (p. 105): misjudging the downside means the computed bet is too big.
+
+Every result with views includes this check, in the app and on the command line:
+- **Re-sized if you're wrong:** the basket sized again with every bear case **10 points more likely** (taken from the bull case), and again with every bear loss **1.5× deeper**.
+- **A verdict per name:** **Robust** (keeps 75%+ of its size under both), **Sensitive** (40–75%), or **Fragile** (under 40%).
+- **What being wrong costs:** your basket *as sized*, scored as if each stress were the truth (chance of loss, 1-in-20 worst case, growth).
+
+A Fragile name is one where your conviction is carrying the bet. Recheck the bear case, or size it at quarter Kelly.
+
 ## Conviction journal
 Each logged view records the date, entry price and your scenarios. When the horizon ends it shows as **due**; record `bear`, `base` or `bull` (app: dropdown; CLI: the `outcome` column). Judge the thesis, not the price. You get:
 - **calibration**: for the bull odds you gave (<40%, 40–60%, 60–80%, 80%+), how often bull happened
@@ -96,7 +106,7 @@ Solo Kelly for every S&P 500 name under CAPM (plus `--extra` names and your view
 | Buffett: "25 percent for the largest," up to 40% (p. 96) | Default 25%; app ceiling 40%; CLI warns above it |
 | Concentrate in 5–20 names (p. 3) | Up to 15 in the app |
 | Buy and hold; Shannon didn't trim (p. 82) | Buy-and-hold horizon |
-| Kelly needs accurate probabilities (p. 105) | Conviction journal + calibration |
+| Kelly needs accurate probabilities; misjudged downside overstates the bet (p. 105) | "What if I'm wrong?" stress test on every result, plus the conviction journal's calibration over time |
 | "Know-nothing" investors should index (p. 3) | No view → sized as market exposure under CAPM; `--screen` labeled as the no-edge baseline |
 
 ## Files
@@ -106,7 +116,7 @@ Solo Kelly for every S&P 500 name under CAPM (plus `--extra` names and your view
 | `app.py` | The phone app (same engine) |
 | `views.csv`, `journal.csv` | Your research and track record (not committed; shared by app and CLI) |
 | `views.example.csv` | A starting views file |
-| `tests/` | Offline test suite (fake Yahoo data): book math, views, journal, CLI, app |
+| `tests/` | Offline test suite (fake Yahoo data): book math, views, what-if-wrong, journal, CLI, app |
 
 **Outputs** (decimals: 0.12 = 12%):
 - `kelly_portfolio_YYYY-MM-DD.csv`: one row per name plus `CASH`, with `weight_full_kelly` … `weight_eighth_kelly` (each sums to 1), `edge_source`, `standalone_full_kelly`, your view columns, `margin_of_safety`. The app's **Save these results** button writes the same file.
@@ -116,7 +126,7 @@ Solo Kelly for every S&P 500 name under CAPM (plus `--extra` names and your view
 ## Development
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
-python -m pytest            # ~2 minutes, offline
+python -m pytest            # ~4 minutes, offline
 ```
 Run the tests before merging a branch. Data sources: constituents from Wikipedia (GitHub dataset fallback); 10Y Treasury from FRED (Yahoo `^TNX`, then 4.5% fallback); prices from Yahoo via yfinance (monthly for correlations, daily for current prices). Update `MARKET_RETURN` in `kelly.py` once a year.
 

@@ -539,6 +539,21 @@ def _solve(neg_obj, neg_grad, n: int, max_weight: float, max_leverage: float):
     return w, bool(res.success)
 
 
+def basket_stats(w: np.ndarray, X: np.ndarray, rf_h: float, horizon: float) -> dict:
+    """Outcome stats for weights w over scenario excess returns X (horizon)."""
+    W = 1 + rf_h + X @ w
+    logW = np.log(np.maximum(W, 1e-12))
+    return {
+        "invested": w.sum(), "cash": 1 - w.sum(),
+        "holdings": int((w > 0).sum()),
+        "prob_loss": float(np.mean(W < 1)),
+        "worst_5pct": float(np.quantile(W, 0.05) - 1),
+        "expected_growth_rate": np.expm1(np.mean(logW) / horizon),
+        "expected_return": np.mean(W) ** (1 / horizon) - 1,
+        "volatility": np.std(logW) / np.sqrt(horizon),
+    }
+
+
 def portfolio_kelly(prices: pd.DataFrame, results: pd.DataFrame,
                     basket: list[str], rf: float,
                     max_weight: float = PORTFOLIO_MAX_WEIGHT,
@@ -582,19 +597,8 @@ def portfolio_kelly(prices: pd.DataFrame, results: pd.DataFrame,
         w = c * u
         w[w < 1e-5] = 0.0
         weights[f"weight_{label}_kelly"] = w
-        W = 1 + rf_h + X @ w
-        logW = np.log(np.maximum(W, 1e-12))
-        summary.append({
-            "kelly_fraction": label,
-            "invested": w.sum(), "cash": 1 - w.sum(),
-            "holdings": int((w > 0).sum()),
-            "prob_loss": float(np.mean(W < 1)),
-            "worst_5pct": float(np.quantile(W, 0.05) - 1),
-            "expected_growth_rate": np.expm1(np.mean(logW) / horizon),
-            "expected_return": np.mean(W) ** (1 / horizon) - 1,
-            "volatility": np.std(logW) / np.sqrt(horizon),
-            "solver_ok": success,
-        })
+        summary.append({"kelly_fraction": label, **basket_stats(w, X, rf_h, horizon),
+                        "solver_ok": success})
     n_views = int((ok.loc[basket, "edge_source"] == "views").sum())
     log(f"Portfolio: {n_views} of {n} names sized on your views, the rest on CAPM; "
         f"{horizon:g}-year horizon, {n_scenarios:,} scenarios")
@@ -616,6 +620,113 @@ def portfolio_kelly(prices: pd.DataFrame, results: pd.DataFrame,
     summ.insert(3, "months_used", months)
     summ.insert(4, "horizon_years", horizon)
     return out, summ
+
+
+# ------------------------------------------------------- what if wrong ---
+# Thorp (p. 105): misjudging the downside, or a Black Swan, means the computed
+# Kelly bet is too big. The stress test makes that fragility visible: the same
+# basket re-sized with every bear case a little worse, and your current
+# weights scored as if that were the truth.
+STRESS_ODDS = 0.10        # bear case 10 points more likely (taken from bull)
+STRESS_LOSS = 1.5         # bear case 50% deeper
+
+
+def stress_views(views: pd.DataFrame, odds_shift: float = 0.0,
+                 loss_mult: float = 1.0) -> pd.DataFrame:
+    """Every view's bear case made worse: odds up by odds_shift (taken from the
+    bull case, then the base case), loss multiplied by loss_mult (max 100%)."""
+    v = normalize_views(views).copy()
+    take_bull = np.minimum(odds_shift, (v["p_bull"] - 0.01).clip(lower=0))
+    take_base = np.minimum(odds_shift - take_bull, v["p_base"])
+    v["p_bear"] = v["p_bear"] + take_bull + take_base
+    v["p_base"] = v["p_base"] - take_base
+    v["p_bull"] = 1 - v["p_bear"] - v["p_base"]
+    v["bear"] = (v["bear"] * loss_mult).clip(upper=1.0)
+    return v
+
+
+def _verdict(mine: float, worst: float) -> str:
+    if mine <= 1e-4:
+        return "Not held"
+    ratio = worst / mine
+    return "Robust" if ratio >= 0.75 else "Sensitive" if ratio >= 0.40 else "Fragile"
+
+
+def what_if_wrong(prices: pd.DataFrame, tickers: list[str], rf: float,
+                  views: pd.DataFrame | None, weights: pd.DataFrame, fraction: str,
+                  prices_now: dict[str, float] | None = None,
+                  market_return: float = MARKET_RETURN,
+                  horizon: float = DEFAULT_HORIZON,
+                  max_weight: float = PORTFOLIO_MAX_WEIGHT,
+                  max_leverage: float = PORTFOLIO_MAX_LEVERAGE,
+                  shrink: float = COV_SHRINK,
+                  n_scenarios: int = N_SCENARIOS,
+                  ) -> tuple[pd.DataFrame, pd.DataFrame] | None:
+    """
+    Returns (by_name, held) or None when no name has a view.
+      by_name : your weight vs. what Kelly would bet under each stress, and a
+                verdict (Robust / Sensitive / Fragile) for names with a view
+      held    : your current weights, as sized, scored under each stress
+    """
+    if views is None or not len(views):
+        return None
+    col = f"weight_{fraction}_kelly"
+    mine = weights[weights.ticker != "CASH"].set_index("ticker")[col]
+    basket = list(mine.index)
+    stresses = {
+        f"Bear odds +{STRESS_ODDS * 100:.0f} pts": stress_views(views, STRESS_ODDS, 1.0),
+        f"Bear loss {STRESS_LOSS:g}x deeper": stress_views(views, 0.0, STRESS_LOSS),
+    }
+    kw = dict(market_return=market_return, horizon=horizon, max_weight=max_weight,
+              max_leverage=max_leverage, shrink=shrink, n_scenarios=n_scenarios)
+    rf_h = (1 + rf) ** horizon - 1
+    corr, _ = _correlation(prices, basket, shrink)
+
+    by_name = pd.DataFrame({"ticker": basket, "mine": mine.values})
+    held = []
+    with captured_log():
+        res0 = compute_kelly(prices, rf, market_return, views=views, horizon=horizon,
+                             prices_now=prices_now).set_index("ticker")
+        X0 = simulate_outcomes(res0, basket, corr, horizon, n_scenarios) - rf_h
+        held.append({"scenario": "As you entered it",
+                     **basket_stats(mine.values, X0, rf_h, horizon)})
+        for name, sv in stresses.items():
+            res, w, _ = size_basket(prices, tickers, rf, views=sv, prices_now=prices_now, **kw)
+            by_name[name] = w.set_index("ticker")[col].reindex(basket).fillna(0).values
+            ok = res.set_index("ticker")
+            X = simulate_outcomes(ok, basket, corr, horizon, n_scenarios) - rf_h
+            held.append({"scenario": name, **basket_stats(mine.values, X, rf_h, horizon)})
+
+    viewed = set(normalize_views(views).index)
+    stress_cols = list(stresses)
+    by_name["edge"] = ["views" if t in viewed else "CAPM" for t in basket]
+    by_name["verdict"] = [
+        _verdict(r["mine"], min(r[c] for c in stress_cols)) if r["edge"] == "views" else ""
+        for _, r in by_name.iterrows()]
+    by_name = by_name[["ticker", "edge", "mine", *stress_cols, "verdict"]]
+    return by_name, pd.DataFrame(held)
+
+
+def what_if_message(by_name: pd.DataFrame, held: pd.DataFrame) -> str:
+    """One plain sentence: the most fragile bet, and what being wrong costs."""
+    stress = by_name.columns[3]
+    v = by_name[(by_name.edge == "views") & (by_name.mine > 1e-4)].copy()
+    lines = []
+    if len(v):
+        v["drop"] = 1 - v[stress] / v["mine"]
+        worst = v.sort_values("drop", ascending=False).iloc[0]
+        if worst["drop"] > 0.25:
+            lines.append(f"If every bear case is {STRESS_ODDS * 100:.0f} points more likely, "
+                         f"Kelly would cut {worst['ticker']} from {worst['mine']:.0%} to "
+                         f"{worst[stress]:.0%}.")
+        else:
+            lines.append("Your bets hold up: being somewhat too optimistic on the bear "
+                         "cases barely changes the sizing.")
+    base, bad = held.iloc[0], held.iloc[1]
+    lines.append(f"Held as sized, your chance of loss would go from {base['prob_loss']:.0%} "
+                 f"to {bad['prob_loss']:.0%} and expected growth from "
+                 f"{base['expected_growth_rate']:.1%} to {bad['expected_growth_rate']:.1%}/yr.")
+    return " ".join(lines)
 
 
 # -------------------------------------------------------------- journal ---
@@ -1091,6 +1202,23 @@ def main(argv: list[str] | None = None) -> int:
         "margin_of_safety": "MoS", "solo_kelly": "Solo Kelly", "swing": "Swing"})
     print("\n" + _fmt_table(alloc, pct=["Weight", "MoS", "Solo Kelly", "Swing"], money=["$"]))
     wide, fstats = fractions_table(weights, summary)
+    wiw = what_if_wrong(prices, tickers, rf, in_basket if len(in_basket) else None,
+                        weights, frac, prices_now=prices_now,
+                        market_return=args.market_return, horizon=args.horizon,
+                        max_weight=args.max_weight, max_leverage=args.max_invested,
+                        shrink=args.shrink, n_scenarios=args.scenarios)
+    if wiw is not None:
+        by_name, held = wiw
+        print("\nWhat if I'm wrong?")
+        print(what_if_message(by_name, held))
+        t = by_name.rename(columns={"ticker": "Ticker", "edge": "Edge",
+                                    "mine": f"{FRACTION_NAMES[frac]} Kelly",
+                                    "verdict": "Verdict"})
+        print(_fmt_table(t, pct=list(t.columns[2:-1])))
+        h = held[["scenario", "prob_loss", "worst_5pct", "expected_growth_rate"]].rename(
+            columns={"scenario": "Your basket if the truth is", "prob_loss": "Chance of loss",
+                     "worst_5pct": "Worst 1-in-20", "expected_growth_rate": "Exp. growth/yr"})
+        print(_fmt_table(h, pct=list(h.columns[1:])))
     print("\nAll fractions:\n" + _fmt_table(fstats.reset_index(),
                                             pct=[c for c in fstats.columns]))
     print(run_note(summary, rf, rf_source, logs))
