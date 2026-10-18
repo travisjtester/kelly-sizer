@@ -50,7 +50,7 @@ python kelly_sp500.py --portfolio-top 15
 |---|---|---|
 | `--portfolio` / `--portfolio-top N` | — | The basket: explicit, or the top N by solo Kelly |
 | `--horizon` | 3 | Buy-and-hold years (how long theses take to play out) |
-| `--max-weight` | 0.25 | Per-name cap (Buffett: "25 percent for the largest"; 0.40 for an AmEx-level idea) |
+| `--max-weight` | 0.25 | Per-name cap (Buffett: "25 percent for the largest"). The app tops out at 0.40, Buffett's largest position ever (AmEx); the CLI allows more but warns |
 | `--max-leverage` | 1.0 | Max total invested; >1 allows margin |
 | `--shrink` | 0.20 | Pull correlations toward independence (0–1) |
 | `--scenarios` | 20000 | Simulated joint outcomes |
@@ -101,7 +101,7 @@ Results update live after the first **Size it**. Prices are cached (monthly 12h,
 | Margin of safety (pp. 3, 208) | `value` input → bull case and margin-of-safety column |
 | Size bets jointly; isolated Kelly "generally overestimates" (p. 105) | One solve for the whole basket; solo Kelly shown as a ceiling |
 | Kelly is the maximum bet; half Kelly ≈ ¾ of the growth, ½ the volatility (pp. 85–86) | Fractions = c × the Kelly bet, then caps; leverage 1.0 by default |
-| Buffett: "25 percent for the largest," up to 40% (p. 96) | `--max-weight` default 0.25 |
+| Buffett: "25 percent for the largest," up to 40% (p. 96) | Default cap 25%; app ceiling 40%; CLI warns above it |
 | Concentrate in 5–20 names (p. 3) | App takes up to 15 |
 | Buy and hold; Shannon didn't trim (p. 82) | Buy-and-hold horizon, no rebalancing assumption |
 | Kelly needs accurate probabilities; misjudged downside overstates the bet (p. 105) | Conviction journal + calibration |

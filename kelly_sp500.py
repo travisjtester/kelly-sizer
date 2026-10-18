@@ -49,6 +49,7 @@ CHUNK = 100              # tickers per bulk download request
 
 # Portfolio (multi-asset) Kelly defaults
 PORTFOLIO_MAX_WEIGHT = 0.25   # per-name cap on the full-Kelly book
+BOOK_MAX_WEIGHT = 0.40        # Buffett's largest ever (AmEx, 40%); app ceiling
 PORTFOLIO_MAX_LEVERAGE = 1.0  # sum of weights; 1.0 = no margin
 COV_SHRINK = 0.20             # blend sample covariance toward its diagonal
 
@@ -779,7 +780,7 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--portfolio-top", type=int,
                    help="Optimize joint Kelly weights for the top N by standalone Kelly")
     g.add_argument("--max-weight", type=float, default=PORTFOLIO_MAX_WEIGHT,
-                   help=f"Per-name cap (default {PORTFOLIO_MAX_WEIGHT})")
+                   help=f"Per-name cap (default {PORTFOLIO_MAX_WEIGHT}; book ceiling {BOOK_MAX_WEIGHT})")
     g.add_argument("--max-leverage", type=float, default=PORTFOLIO_MAX_LEVERAGE,
                    help=f"Max total invested; >1 allows margin (default {PORTFOLIO_MAX_LEVERAGE})")
     g.add_argument("--shrink", type=float, default=COV_SHRINK,
@@ -802,6 +803,9 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     if args.log and not (args.journal and args.views):
         p.error("--log needs both --views and --journal")
+    if args.max_weight > BOOK_MAX_WEIGHT:
+        log(f"Note: --max-weight {args.max_weight:.0%} is above the book's 40% ceiling "
+            f"(Buffett's largest position, American Express). Treat this as a what-if.")
 
     views = load_views(args.views) if args.views else normalize_views(None)
     if len(views):

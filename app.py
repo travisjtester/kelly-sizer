@@ -30,7 +30,7 @@ def _engine_loaded() -> dict:
 # After a merge, Cloud would pair the new app with the old engine in memory,
 # so reload it when the file on disk is newer than what's loaded.
 _loaded, _mtime = _engine_loaded(), os.path.getmtime(ks.__file__)
-if _mtime != _loaded["mtime"] or not hasattr(ks, "journal_report"):
+if _mtime != _loaded["mtime"] or not hasattr(ks, "BOOK_MAX_WEIGHT"):
     ks = importlib.reload(ks)
     _loaded["mtime"] = _mtime
 
@@ -209,10 +209,11 @@ with st.expander("Settings"):
     horizon = st.slider("Holding horizon (years)", 1.0, 10.0, ks.DEFAULT_HORIZON, 0.5,
                         help="Buy and hold for this long: how long your theses take to "
                              "play out. Applies to every name.")
-    max_weight = st.slider("Max per name", 0.05, 1.0, ks.PORTFOLIO_MAX_WEIGHT, 0.05,
-                           format="%.2f",
-                           help="Buffett: '25 percent for the largest'; "
-                                "40% for an American Express-level idea.")
+    max_weight = st.slider("Max per name", 0.05, ks.BOOK_MAX_WEIGHT,
+                           ks.PORTFOLIO_MAX_WEIGHT, 0.05, format="%.2f",
+                           help="Buffett: '25 percent for the largest'. 40% is the "
+                                "ceiling: his biggest position ever, American Express "
+                                "after the salad-oil scandal.")
     max_lev = st.slider("Max invested (1.0 = no margin)", 0.5, 2.0,
                         ks.PORTFOLIO_MAX_LEVERAGE, 0.1)
     shrink = st.slider("Correlation shrinkage", 0.0, 1.0, ks.COV_SHRINK, 0.05,
