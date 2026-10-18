@@ -32,6 +32,7 @@ def test_capm_only_basket(app):
     labels = [m.label for m in at.metric]
     assert labels[:3] == ["Chance of loss (3y)", "Worst case, 1-in-20 (3y)", "Exp. growth"]
     assert len(at.toggle) == 0                   # no backtest
+    assert any("Add your research to see how sensitive" in c.value for c in at.caption)
 
 
 def test_max_per_name_capped_at_40(app):
@@ -50,6 +51,9 @@ def test_views_drive_sizing_and_match_the_cli_helpers(app):
     assert {"ticker", "weight", "dollars", "edge", "margin_of_safety", "solo_kelly",
             "swing"} <= set(alloc.columns)
     assert set(alloc.edge.dropna()) == {"views", "CAPM"}
+    assert any(h.value == "What if I'm wrong?" for h in at.subheader)
+    wrong = next(d.value for d in at.dataframe if "verdict" in d.value.columns)
+    assert set(wrong.verdict) <= {"Robust", "Sensitive", "Fragile", "Not held", ""}
 
 
 def test_journal_log_and_calibration(app):

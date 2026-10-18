@@ -23,6 +23,7 @@ def test_uses_views_csv_and_logs_to_journal(tmp_path, monkeypatch, capsys):
     assert run(tmp_path, monkeypatch, "NVDA", "ASML", "KO", "VOO", "--log") == 0
     out = capsys.readouterr().out
     assert "Using your views from views.csv" in out and "Sized on your research for 3" in out
+    assert "What if I'm wrong?" in out and "Verdict" in out
     j = ks.load_journal(tmp_path / "journal.csv")
     assert set(j.ticker) == {"NVDA", "ASML", "KO"} and j.entry_price.notna().all()
 
