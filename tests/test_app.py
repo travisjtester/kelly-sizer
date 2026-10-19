@@ -50,10 +50,10 @@ def test_views_drive_sizing_and_match_the_cli_helpers(app):
     alloc = at.dataframe[1].value
     assert {"ticker", "weight", "dollars", "edge", "margin_of_safety", "solo_kelly",
             "swing"} <= set(alloc.columns)
-    assert set(alloc.edge.dropna()) == {"views", "CAPM"}
-    assert any(h.value == "What if I'm wrong?" for h in at.subheader)
-    wrong = next(d.value for d in at.dataframe if "verdict" in d.value.columns)
-    assert set(wrong.verdict) <= {"Robust", "Sensitive", "Fragile", "Not held", ""}
+    assert set(alloc.edge.dropna()) - {""} == {"views", "CAPM"}
+    wrong = next(d.value for d in at.dataframe if "Verdict" in d.value.columns)
+    assert set(wrong.Verdict) <= {"Robust", "Sensitive", "Fragile", "Not held", ""}
+    assert any(h.value.startswith(":red[What if") for h in at.subheader)
 
 
 def test_journal_log_and_calibration(app):

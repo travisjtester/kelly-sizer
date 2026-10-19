@@ -38,6 +38,22 @@ FRACTIONS = {"Full": "full", "Half": "half", "Quarter": "quarter", "Eighth": "ei
 DEFAULT_TICKERS = ["NVDA", "ASML", "AVGO", "MSFT", "VOO"]
 VIEW_FIELDS = ["p_bear", "bear", "p_base", "base", "bull", "value"]
 
+# Brand palette (see .streamlit/config.toml): teal #379A8B, coffee #D1B07C,
+# red #DB444B, grey #D3D3D3. Verdict text uses the same 4.5:1+ shades as the
+# alerts; no single shade is readable on both white and dark backgrounds.
+VERDICT_SHADES = {
+    "light": {"Fragile": "#A3262C", "Sensitive": "#6E5226", "Robust": "#1F6B60"},
+    "dark": {"Fragile": "#F2898E", "Sensitive": "#E6CFA6", "Robust": "#7FCDBF"},
+}
+
+
+def verdict_colors() -> dict:
+    try:
+        mode = "dark" if st.context.theme.type == "dark" else "light"
+    except Exception:
+        mode = "light"
+    return VERDICT_SHADES[mode]
+
 
 # ------------------------------------------------------------- cached data ---
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
@@ -262,6 +278,10 @@ if results_ready:
         if c in tbl.columns:
             tbl[c] = tbl[c] * 100
     st.subheader(f"{fraction_label} Kelly allocation")
+    tbl["edge"] = tbl["edge"].fillna("")
+    for c in ["margin_of_safety", "solo_kelly", "swing"]:      # blanks, not "None"
+        if c in tbl.columns:
+            tbl[c] = tbl[c].map(lambda v: "" if pd.isna(v) else f"{v:.0f}%")
     st.dataframe(
         tbl, hide_index=True, width="stretch",
         column_config={
@@ -270,19 +290,16 @@ if results_ready:
                                                       min_value=0, max_value=100),
             "dollars": st.column_config.NumberColumn("$", format="$%,.0f"),
             "edge": st.column_config.TextColumn("Edge"),
-            "margin_of_safety": st.column_config.NumberColumn("MoS", format="%.0f%%",
-                                                              help="Margin of safety"),
-            "solo_kelly": st.column_config.NumberColumn(
-                "Solo Kelly", format="%.0f%%",
-                help="This name's Kelly bet on its own: a ceiling, not a target"),
-            "swing": st.column_config.NumberColumn(
-                "Swing", format="%.0f%%",
-                help="Annual price volatility: how bumpy, not how risky"),
+            "margin_of_safety": st.column_config.Column("MoS", help="Margin of safety"),
+            "solo_kelly": st.column_config.Column(
+                "Solo Kelly", help="This name's Kelly bet on its own: a ceiling, not a target"),
+            "swing": st.column_config.Column(
+                "Swing", help="Annual price volatility: how bumpy, not how risky"),
         },
     )
 
     # ---- what if I'm wrong (shared with the CLI): Thorp's warning, p. 105
-    st.subheader("What if I'm wrong?")
+    st.subheader(":red[What if I'm wrong?]", divider="red")
     wiw = ks.what_if_wrong(prices, tickers, rf, views, weights, frac, prices_now=prices_now,
                            market_return=mkt_ret, horizon=horizon, max_weight=max_weight,
                            max_leverage=max_lev, shrink=shrink)
@@ -291,26 +308,25 @@ if results_ready:
                    "cases. CAPM names have no view to be wrong about.")
     else:
         by_name, held = wiw
-        fragile = (by_name.verdict == "Fragile").any()
-        (st.warning if fragile else st.success)(ks.what_if_message(by_name, held))
+        verdicts = set(by_name.verdict)
+        banner = (st.error if "Fragile" in verdicts else
+                  st.warning if "Sensitive" in verdicts else st.success)
+        banner(ks.what_if_message(by_name, held))
         st.caption("Kelly is only as good as your bear case. Thorp: misjudging the downside "
                    "means the computed bet is too big. Each column re-sizes the basket "
                    "with every bear case worse than you entered.")
-        t = by_name.copy()
-        for c in t.columns[2:-1]:
-            t[c] = t[c] * 100
-        st.dataframe(
-            t, hide_index=True, width="stretch",
-            column_config={
-                "ticker": st.column_config.TextColumn("Ticker", pinned=True),
-                "edge": st.column_config.TextColumn("Edge"),
-                "mine": st.column_config.NumberColumn(f"{fraction_label} Kelly", format="%.1f%%"),
-                **{c: st.column_config.NumberColumn(c, format="%.1f%%") for c in t.columns[3:-1]},
-                "verdict": st.column_config.TextColumn(
-                    "Verdict", help="Robust: keeps 75%+ of its size under both stresses. "
-                                    "Sensitive: 40-75%. Fragile: under 40%."),
-            },
-        )
+        t = by_name.rename(columns={"ticker": "Ticker", "edge": "Edge",
+                                    "mine": f"{fraction_label} Kelly", "verdict": "Verdict"})
+        pct_cols = list(t.columns[2:-1])
+        t = t[["Ticker", "Verdict", *pct_cols, "Edge"]]      # verdict visible on a phone
+        styled = (t.style
+                  .format({c: "{:.1%}" for c in pct_cols})
+                  .map(lambda v, c=verdict_colors(): f"color: {c[v]}; font-weight: 600"
+                       if v in c else "", subset=["Verdict"]))
+        st.dataframe(styled, hide_index=True, width="stretch",
+                     column_config={"Ticker": st.column_config.TextColumn(pinned=True)})
+        st.caption("Robust keeps 75%+ of its size under both stresses, Sensitive 40–75%, "
+                   "Fragile under 40%.")
         h = held.set_index("scenario")[["prob_loss", "worst_5pct", "expected_growth_rate"]]
         h.columns = [f"Chance of loss ({horizon:g}y)", f"Worst 1-in-20 ({horizon:g}y)",
                      "Exp. growth/yr"]

@@ -99,3 +99,18 @@ def test_short_horizon_converges_to_continuous_kelly(prices):
     merton = np.linalg.solve(cov, alpha - np.log1p(RF))
     got = w.set_index("ticker").loc[basket, "weight_full_kelly"].to_numpy()
     assert np.allclose(got, merton, rtol=0.08, atol=0.05), (got, merton)
+
+
+def test_solver_converges_at_every_fraction():
+    # Regression: fractional solves search wider limits (scaled by 1/c) and used
+    # to stall at the ruin boundary ("Inequality constraints incompatible").
+    from conftest import fake_download
+    names = ["NVDA", "ASML", "AVGO", "MSFT", "VOO", "KO", "JNJ", "XOM"]
+    prices = fake_download(["^GSPC", *names])["Close"]
+    views = ks.load_views(ks.Path(__file__).resolve().parents[1] / "views.example.csv")
+    rng = np.random.default_rng(0)
+    for _ in range(8):
+        basket = list(rng.choice(names, size=rng.integers(3, 8), replace=False))
+        _, _, s = ks.size_basket(prices, basket, 0.051, views=views)
+        assert s.solver_ok.all(), s[["kelly_fraction", "solver_ok"]]
+        assert (s.worst_5pct > -1).all()

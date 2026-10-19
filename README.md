@@ -17,6 +17,7 @@ python -m streamlit run app.py          # local: http://localhost:8501
 Deployed free on Streamlit Community Cloud (share.streamlit.io → this repo → `app.py`). On iPhone: open the URL in Safari → Share → **Add to Home Screen**.
 
 - Research table: Bear odds / Bear loss / Base odds / Base / Bull or Value $; bull odds, price and margin of safety fill in.
+- Brand palette in `.streamlit/config.toml` (light and dark): teal `#379A8B` for primary and success, coffee `#D1B07C` for caution, red `#DB444B` for "What if I'm wrong?" and fragile bets, grey `#D3D3D3` for borders. Text shades meet 4.5:1 contrast in both modes.
 - **Save / Load** views and journal CSVs (iPhone saves to Files). Cloud sessions don't keep files, so save before you leave. The same files work on the command line.
 - To preload, commit `views.csv` / `journal.csv` to the repo root (`git add -f`; `*.csv` is gitignored), but only if you're fine with them being as public as the repo.
 

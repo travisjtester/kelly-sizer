@@ -532,11 +532,28 @@ def _solve(neg_obj, neg_grad, n: int, max_weight: float, max_leverage: float):
         constraints=[{"type": "ineq",
                       "fun": lambda w: max_leverage - w.sum(),
                       "jac": lambda w: -np.ones(n)}],
-        options={"maxiter": 500, "ftol": 1e-12},
+        options={"maxiter": 1000, "ftol": 1e-12},
     )
     w = np.clip(res.x, 0, None)
     w[w < 1e-5] = 0.0
     return w, bool(res.success)
+
+
+_RUIN_EPS = 1e-3
+
+
+def _smooth_log(W: np.ndarray) -> np.ndarray:
+    """log(W), continued below a tiny wealth level as a steep downward parabola
+    instead of a flat floor. Ruin stays catastrophic, but the optimizer always
+    has a slope pointing back to safety (a flat floor made SLSQP stall)."""
+    e = _RUIN_EPS
+    d = W - e
+    return np.where(W >= e, np.log(np.maximum(W, e)), np.log(e) + d / e - d * d / (2 * e * e))
+
+
+def _smooth_log_grad(W: np.ndarray) -> np.ndarray:
+    e = _RUIN_EPS
+    return np.where(W >= e, 1 / np.maximum(W, e), 1 / e - (W - e) / (e * e))
 
 
 def basket_stats(w: np.ndarray, X: np.ndarray, rf_h: float, horizon: float) -> dict:
@@ -580,11 +597,10 @@ def portfolio_kelly(prices: pd.DataFrame, results: pd.DataFrame,
     n = len(basket)
 
     def neg_obj(w):
-        return -np.mean(np.log(np.maximum(1 + rf_h + X @ w, 1e-12)))
+        return -np.mean(_smooth_log(1 + rf_h + X @ w))
 
     def neg_grad(w):
-        W = np.maximum(1 + rf_h + X @ w, 1e-12)
-        return -(X / W[:, None]).mean(axis=0)
+        return -(X * _smooth_log_grad(1 + rf_h + X @ w)[:, None]).mean(axis=0)
 
     # Fractional Kelly c means "bet c times what Kelly says", then apply your
     # position limits. Solve for the Kelly bet u with limits scaled by 1/c,
