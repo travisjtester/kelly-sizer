@@ -1,2 +1,38 @@
+# Kelly Sizer brand palette
+#   teal   #379A8B  primary, success, info
+#   coffee #D1B07C  warnings / caution
+#   red    #DB444B  "What if I'm wrong?", errors, fragile bets
+#   grey   #D3D3D3  borders
+# Text shades are darker (light mode) or lighter (dark mode) versions of the
+# same hues, chosen for at least 4.5:1 contrast on their alert backgrounds.
+
 [theme]
 primaryColor = "#379A8B"
+
+[theme.light]
+primaryColor = "#379A8B"
+greenColor = "#379A8B"
+greenTextColor = "#1F6B60"
+blueColor = "#379A8B"
+blueTextColor = "#1F6B60"
+yellowColor = "#D1B07C"
+yellowTextColor = "#6E5226"
+orangeColor = "#D1B07C"
+orangeTextColor = "#6E5226"
+redColor = "#DB444B"
+redTextColor = "#A3262C"
+borderColor = "#D3D3D3"
+dataframeBorderColor = "#D3D3D3"
+
+[theme.dark]
+primaryColor = "#379A8B"
+greenColor = "#379A8B"
+greenTextColor = "#7FCDBF"
+blueColor = "#379A8B"
+blueTextColor = "#7FCDBF"
+yellowColor = "#D1B07C"
+yellowTextColor = "#E6CFA6"
+orangeColor = "#D1B07C"
+orangeTextColor = "#E6CFA6"
+redColor = "#DB444B"
+redTextColor = "#F2898E"
