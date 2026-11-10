@@ -226,6 +226,22 @@ def _column_to_fraction(col: pd.Series, as_pct: bool) -> pd.Series:
     return num / 100 if as_pct else num.where(~has_pct, num / 100)
 
 
+def _warn_mixed_bear_signs(d: pd.DataFrame) -> None:
+    """Bear is read as the size of the loss, so its sign is dropped. That's
+    fine while a file is consistent, but mixed signs usually mean some rows
+    were computed as a return (low target / price - 1): a low target above the
+    price then comes out positive and would be read as a loss. Flag the rows
+    that disagree with the rest of the file."""
+    neg, pos = d["bear"] < 0, d["bear"] > 0
+    if not (neg.any() and pos.any()):
+        return
+    odd = pos if neg.sum() >= pos.sum() else neg
+    log("Views: bear signs are mixed; check " + ", ".join(d.loc[odd, "ticker"])
+        + ". Bear is read as the size of the loss whatever its sign, so a row worked "
+          "out as low target / price − 1 with the low target above the price would "
+          "become a loss that isn't there.")
+
+
 def normalize_views(df: pd.DataFrame | None) -> pd.DataFrame:
     """
     Clean a views table to index=ticker with VIEW_COLS (+ p_bull, notes).
@@ -264,7 +280,8 @@ def normalize_views(df: pd.DataFrame | None) -> pd.DataFrame:
             d[c] = _column_to_fraction(d[c], as_pct)
     d["value"] = pd.to_numeric(d["value"].astype(str).str.replace(r"[$,]", "", regex=True),
                                errors="coerce")
-    d["bear"] = d["bear"].abs()
+    _warn_mixed_bear_signs(d)
+    d["bear"] = d["bear"].abs()     # a loss either way: -0.30 and 0.30 both mean lose 30%
     d["p_base"] = d["p_base"].fillna(0.0)
     d.loc[d["p_base"] == 0, "base"] = np.nan
 
@@ -1035,6 +1052,19 @@ def safe_to_csv(df: pd.DataFrame, path: Path) -> Path:
         return alt
 
 
+# Yahoo's sector names -> the GICS names the S&P 500 list uses, so a basket
+# mixing S&P and non-S&P names reads one way. Sectors already named the same
+# (Energy, Industrials, Utilities, Real Estate, Communication Services) pass through.
+YAHOO_TO_GICS = {
+    "Technology": "Information Technology",
+    "Healthcare": "Health Care",
+    "Financial Services": "Financials",
+    "Consumer Cyclical": "Consumer Discretionary",
+    "Consumer Defensive": "Consumer Staples",
+    "Basic Materials": "Materials",
+}
+
+
 def lookup_extra_meta(tickers: list[str]) -> pd.DataFrame:
     """Name/sector for non-S&P tickers (a few .info calls, best effort)."""
     import yfinance as yf
@@ -1048,8 +1078,22 @@ def lookup_extra_meta(tickers: list[str]) -> pd.DataFrame:
             sector = info.get("sector")
         except Exception:
             pass
-        rows.append({"ticker": t, "name": name, "sector": sector})
-    return pd.DataFrame(rows)
+        rows.append({"ticker": t, "name": name, "sector": YAHOO_TO_GICS.get(sector, sector)})
+    return pd.DataFrame(rows, columns=["ticker", "name", "sector"])
+
+
+def basket_meta(tickers: list[str]) -> pd.DataFrame:
+    """Name/sector for a basket: the S&P 500 list, plus a Yahoo lookup for the rest."""
+    try:
+        with captured_log():                       # keep the source chatter off the CLI
+            meta = get_sp500_constituents()[["ticker", "name", "sector"]]
+    except Exception:
+        meta = pd.DataFrame(columns=["ticker", "name", "sector"])
+    meta = meta[meta["ticker"].isin(tickers)]
+    missing = [t for t in tickers if t not in set(meta["ticker"])]
+    if missing:
+        meta = pd.concat([meta, lookup_extra_meta(missing)], ignore_index=True)
+    return meta.reset_index(drop=True)
 
 
 # -------------------------------------------------------------------- CLI ---
@@ -1194,11 +1238,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     in_basket = views.loc[[t for t in tickers if t in views.index]]
     prices_now = download_latest_prices(list(in_basket.index)) if len(in_basket) else {}
+    meta = basket_meta(tickers)
     try:
         with captured_log() as logs:
             results, weights, summary = size_basket(
                 prices, tickers, rf, views=in_basket if len(in_basket) else None,
-                prices_now=prices_now, market_return=args.market_return,
+                prices_now=prices_now, meta=meta, market_return=args.market_return,
                 horizon=args.horizon, max_weight=args.max_weight,
                 max_leverage=args.max_invested, shrink=args.shrink,
                 n_scenarios=args.scenarios)

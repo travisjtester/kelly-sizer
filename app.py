@@ -139,11 +139,26 @@ st.title("📐 Kelly Sizer")
 st.caption("Kelly position sizing after *Concentrated Investing*: bet big when you hold "
            "an edge, never risk ruin, and size the whole basket at once.")
 
+MAX_PICKS = 15
+
+# A views CSV just loaded: its tickers join the basket. The picker can't be
+# changed after it's drawn, so the upload queues them and this applies them on
+# the rerun. The file's names come first so they make the cap.
+queued = st.session_state.pop("_add_picks", None)
+if queued:
+    current = st.session_state.get("picks", DEFAULT_TICKERS)
+    merged = list(dict.fromkeys([*queued, *current]))
+    st.session_state.picks = merged[:MAX_PICKS]
+    if len(merged) > MAX_PICKS:
+        st.session_state.setdefault("_upload_notes", []).append(
+            f"The basket holds {MAX_PICKS} names, so these didn't fit: "
+            + ", ".join(merged[MAX_PICKS:]) + ".")
+
 picks = st.multiselect(
     "Tickers (type any symbol, e.g. TSM, ASML, VOO)",
     options=st.session_state.ticker_options,
     default=DEFAULT_TICKERS,
-    max_selections=15,
+    max_selections=MAX_PICKS,
     accept_new_options=True,
     key="picks",
 )
@@ -217,12 +232,17 @@ with st.expander("Your research (views)", expanded=bool(store)):
                             label_visibility="collapsed")
     if file is not None and st.session_state.get("_views_loaded") != file.file_id:
         try:
-            loaded = ks.normalize_views(pd.read_csv(file))
+            with ks.captured_log() as notes:
+                loaded = ks.normalize_views(pd.read_csv(file))
             store.update({t: {k: r[k] for k in VIEW_FIELDS} for t, r in loaded.iterrows()})
             st.session_state._views_loaded = file.file_id
+            st.session_state._add_picks = list(loaded.index)
+            st.session_state._upload_notes = list(notes)
             st.rerun()
         except ValueError as e:
             st.error(str(e))
+    for note in st.session_state.pop("_upload_notes", []):
+        st.warning(note)
     if store:
         csv = (pd.DataFrame.from_dict(store, orient="index").rename_axis("ticker")
                .reset_index().to_csv(index=False))
