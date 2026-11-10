@@ -1,5 +1,7 @@
 # Kelly Sizer
 
+[![Tests](https://github.com/travisjtester/kelly-sizer/actions/workflows/tests.yml/badge.svg)](https://github.com/travisjtester/kelly-sizer/actions/workflows/tests.yml) [![Live data check](https://github.com/travisjtester/kelly-sizer/actions/workflows/live-data.yml/badge.svg)](https://github.com/travisjtester/kelly-sizer/actions/workflows/live-data.yml)
+
 Kelly Criterion position sizing, built to follow *Concentrated Investing* (Benello, van Biema & Carlisle, Wiley 2016), chapters 3–4: bet big when you hold an edge, don't bet when you don't, never risk ruin, and size the whole portfolio at once.
 
 One engine, two ways in: a **phone app** for sizing on the couch and a **command line** for your desk. They take the same inputs, show the same results in the same words, and share the same two files: `views.csv` (your research) and `journal.csv` (your track record).
@@ -134,7 +136,9 @@ Solo Kelly for every S&P 500 name under CAPM (plus `--extra` names and your view
 pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest            # ~4 minutes, offline
 ```
-Run the tests before merging a branch. Data sources: constituents from Wikipedia (GitHub dataset fallback); the Treasury yield whose maturity is nearest the horizon (1, 2, 3, 5, 7 or 10 years) from FRED (Yahoo `^FVX`/`^TNX`, then 4.5% fallback); prices from Yahoo via yfinance (monthly for correlations, daily for current prices). Update `MARKET_RETURN` in `kelly.py` once a year.
+**Testing.** `python -m pytest` runs the offline suite (fake Yahoo, about 6 minutes). GitHub Actions runs it on every pull request on Python 3.11 and 3.12, and `main` only accepts a PR once it passes, because `main` deploys straight to the live app. `python -m pytest smoke` runs the live data checks against the real sources; Actions runs them every Monday and emails the owner if one breaks.
+
+Data sources: constituents from Wikipedia (GitHub dataset fallback); the Treasury yield whose maturity is nearest the horizon (1, 2, 3, 5, 7 or 10 years) from FRED (Yahoo `^FVX`/`^TNX`, then 4.5% fallback); prices from Yahoo via yfinance (monthly for correlations, daily for current prices). Update `MARKET_RETURN` in `kelly.py` once a year.
 
 ## Operational notes
 - **FRED timeouts** are common from scripts; the fallback is the same 10Y yield.

@@ -1,0 +1,33 @@
+name: Tests
+
+# Runs the offline suite (fake Yahoo, no network) on every pull request and on
+# main. Branch protection requires it to pass before a PR can merge, and main
+# auto-deploys to Streamlit Cloud, so nothing untested goes live.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: python -m pytest -q

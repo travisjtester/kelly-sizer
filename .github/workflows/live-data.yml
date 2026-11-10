@@ -1,0 +1,28 @@
+name: Live data check
+
+# The offline tests can't see a data source breaking. This hits the real ones
+# (FRED, Yahoo, the S&P 500 list) once a week. If it fails, GitHub emails the
+# repo owner. It also runs when the checks themselves change, and on demand
+# from the Actions tab. It never blocks a merge: the sources can blip.
+on:
+  schedule:
+    - cron: "17 13 * * 1"     # Mondays 13:17 UTC (morning in the US)
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "smoke/**"
+      - ".github/workflows/live-data.yml"
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: python -m pytest -q smoke
