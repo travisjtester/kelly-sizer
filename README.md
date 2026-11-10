@@ -74,7 +74,7 @@ Bull odds = `1 − p_bear − p_base`. **Units:** use one style per file. The od
 
 ## How it sizes
 1. Each name gets a distribution of horizon returns: your scenarios where you have a view; otherwise **CAPM** (horizon-matched Treasury + beta × market premium, lognormal with historical volatility).
-2. 20,000 joint outcomes are drawn with a Gaussian copula on historical correlations, so correlated names tend to land on the same side.
+2. 20,000 joint outcomes are drawn with a Student-t copula (5 degrees of freedom) on historical correlations, so correlated names tend to land on the same side, and bad outcomes land together more often than a Gaussian copula allows, as in a crash. Each name keeps its own odds. A pair with under 12 months of shared prices (a recent listing) gets the basket's average correlation rather than zero.
 3. Weights maximize **expected log wealth** at the horizon, long-only, within your caps; the rest earns the risk-free rate. A mix that could wipe out the portfolio scores −∞, so the result **never risks ruin**.
 4. **Fractional Kelly** c = bet c × what Kelly says, *then* apply your caps.
 5. **Solo Kelly** per name is the same calculation for that bet alone: a ceiling, not a target.
