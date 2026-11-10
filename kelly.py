@@ -113,9 +113,10 @@ def get_sp500_constituents() -> pd.DataFrame:
 
 # Cash over a buy-and-hold horizon should earn the Treasury that matures with
 # it. (The book's Kelly formula takes cash at zero; a horizon-matched Treasury
-# is the tool's extension.) Sources, in order: FRED's constant-maturity series,
-# then the Treasury's own daily par yield curve (same maturities), then Yahoo,
-# which carries only the 5- and 10-year, then a constant.
+# is the tool's extension.) Sources, in order: the Treasury's own daily par
+# yield curve, then FRED's constant-maturity series (same maturities; FRED
+# often doesn't answer cloud hosts such as GitHub's), then Yahoo, which
+# carries only the 5- and 10-year, then a constant.
 FRED_TREASURIES = {1: "DGS1", 2: "DGS2", 3: "DGS3", 5: "DGS5", 7: "DGS7", 10: "DGS10"}
 TREASURY_URL = ("https://home.treasury.gov/resource-center/data-chart-center/interest-rates/"
                 "daily-treasury-rates.csv/{year}/all?type=daily_treasury_yield_curve"
@@ -168,13 +169,13 @@ def get_risk_free_rate(horizon: float = DEFAULT_HORIZON) -> tuple[float, str]:
     years = _nearest_maturity(horizon, FRED_TREASURIES)
     series = FRED_TREASURIES[years]
     try:
-        return _fred_yield(series), f"FRED {series}"
-    except Exception as e:
-        log(f"FRED {series} failed ({e}); trying Treasury.gov...")
-    try:
         return _treasury_yield(years), f"Treasury.gov {years} Yr"
     except Exception as e:
-        log(f"Treasury.gov {years} Yr failed ({e}); trying Yahoo...")
+        log(f"Treasury.gov {years} Yr failed ({e}); trying FRED...")
+    try:
+        return _fred_yield(series), f"FRED {series}"
+    except Exception as e:
+        log(f"FRED {series} failed ({e}); trying Yahoo...")
     symbol = YAHOO_TREASURIES[_nearest_maturity(horizon, YAHOO_TREASURIES)]
     try:
         import yfinance as yf
@@ -208,7 +209,8 @@ def download_monthly_closes(tickers: list[str], years: int,
                 close = raw["Close"]
                 if isinstance(close, pd.Series):        # single-ticker edge case
                     close = close.to_frame(chunk[0])
-                frames.append(close)
+                frames.append(_refetch_blanks(close, chunk, retries,
+                                              period=f"{years}y", interval="1mo"))
                 break
             except Exception as e:
                 wait = 5 * 2 ** attempt
@@ -227,6 +229,35 @@ def download_monthly_closes(tickers: list[str], years: int,
 
 
 
+def _refetch_blanks(close: pd.DataFrame, tickers: list[str], retries: int,
+                    **kw) -> pd.DataFrame:
+    """
+    A bulk download can come back with a ticker silently blank: yfinance
+    logs the error (e.g. its cache's "database is locked" when threads collide)
+    and leaves the column empty. Fetch those again one at a time, without
+    threads, rather than let a name quietly drop out of the basket.
+    """
+    import yfinance as yf
+
+    close = close.reindex(columns=list(dict.fromkeys([*close.columns, *tickers])))
+    for t in [t for t in tickers if close[t].isna().all()]:
+        for attempt in range(retries):
+            try:
+                one = yf.download(t, auto_adjust=True, threads=False, progress=False,
+                                  **kw)["Close"]
+                one = one.iloc[:, 0] if isinstance(one, pd.DataFrame) else one
+                if one.notna().any():
+                    close = close.reindex(close.index.union(one.index))
+                    close[t] = one.reindex(close.index)
+                    break
+            except Exception:
+                pass
+            time.sleep(2 * 2 ** attempt)
+        else:
+            log(f"  {t}: no prices after {retries} retries")
+    return close
+
+
 def download_latest_prices(tickers: list[str]) -> dict[str, float]:
     """Most recent daily close per ticker (for margin of safety vs. value)."""
     import yfinance as yf
@@ -240,6 +271,7 @@ def download_latest_prices(tickers: list[str]) -> dict[str, float]:
         close = raw["Close"]
         if isinstance(close, pd.Series):
             close = close.to_frame(tickers[0])
+        close = _refetch_blanks(close, list(tickers), 2, period="5d", interval="1d")
         last = close.ffill().iloc[-1].dropna()
         return {k: float(v) for k, v in last.items()}
     except Exception as e:

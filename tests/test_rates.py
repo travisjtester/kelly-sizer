@@ -34,8 +34,8 @@ def fake_get(fred_ok: bool, treasury_ok: bool):
 
 
 @pytest.mark.parametrize("fred_ok, treasury_ok, want", [
-    (True, True, (0.0361, "FRED DGS2")),                 # skips FRED's blank latest day
-    (False, True, (0.0362, "Treasury.gov 2 Yr")),        # newest row, whatever the order
+    (True, True, (0.0362, "Treasury.gov 2 Yr")),         # Treasury.gov first
+    (True, False, (0.0361, "FRED DGS2")),                # skips FRED's blank latest day
     (False, False, (ks.FALLBACK_RF, "fallback constant")),
 ])
 def test_fallback_order(monkeypatch, fred_ok, treasury_ok, want):
@@ -44,8 +44,8 @@ def test_fallback_order(monkeypatch, fred_ok, treasury_ok, want):
     monkeypatch.setattr("yfinance.Ticker", lambda s: (_ for _ in ()).throw(TimeoutError()))
     rf, source = REAL_RATE(2)
     assert (round(rf, 4), source) == want
-    if not fred_ok:
-        assert sum("fred" in c for c in calls) == ks.RATE_TRIES       # retried once
+    if not treasury_ok:
+        assert sum("treasury.gov" in c for c in calls) >= ks.RATE_TRIES   # retried
 
 
 def test_treasury_csv_newest_row_wins_even_if_listed_first(monkeypatch):
@@ -53,3 +53,22 @@ def test_treasury_csv_newest_row_wins_even_if_listed_first(monkeypatch):
     csv = "\n".join([flipped[0], flipped[2], flipped[1]]) + "\n"
     monkeypatch.setattr(ks.requests, "get", lambda url, **kw: Resp(csv))
     assert ks._treasury_yield(10) == pytest.approx(0.0412)
+
+
+def test_a_ticker_that_comes_back_blank_is_fetched_again(monkeypatch):
+    """yfinance can return a column of NaN (and only log the error) when its
+    cache locks; the download must retry that name rather than drop it."""
+    import yfinance as yf
+    from conftest import fake_download
+    calls = []
+
+    def flaky(tickers, **kw):
+        calls.append(tickers)
+        out = fake_download(tickers, **kw)
+        if isinstance(tickers, list) and "AAA" in tickers:
+            out.loc[:, ("Close", "AAA")] = float("nan")       # blank on the bulk call
+        return out
+    monkeypatch.setattr(yf, "download", flaky)
+    prices = ks.download_monthly_closes(["AAA", "BBB", "^GSPC"], 10)
+    assert prices["AAA"].notna().sum() >= ks.MIN_MONTHS
+    assert "AAA" in calls                                      # refetched on its own

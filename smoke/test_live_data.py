@@ -18,11 +18,6 @@ BASKET = ["AAPL", "MSFT", "KO"]
 
 
 @pytest.mark.parametrize("years", [1, 3, 10])
-def test_fred_treasury_yields(years):
-    assert 0 < ks._fred_yield(ks.FRED_TREASURIES[years]) < 0.20
-
-
-@pytest.mark.parametrize("years", [1, 3, 10])
 def test_treasury_gov_yields(years):
     assert 0 < ks._treasury_yield(years) < 0.20
 
@@ -32,7 +27,7 @@ def test_risk_free_is_horizon_matched(horizon, years):
     """Whichever source answers, the rate must match the horizon: the Yahoo
     fallback only has 5- and 10-year yields."""
     rf, source = ks.get_risk_free_rate(horizon)
-    assert source in (f"FRED {ks.FRED_TREASURIES[years]}", f"Treasury.gov {years} Yr"), source
+    assert source in (f"Treasury.gov {years} Yr", f"FRED {ks.FRED_TREASURIES[years]}"), source
     assert 0 < rf < 0.20
 
 
@@ -46,7 +41,7 @@ def test_sp500_constituents():
 def test_yahoo_monthly_history():
     prices = ks.download_monthly_closes(BASKET + [ks.BENCHMARK], ks.VARIANCE_YEARS)
     assert set(BASKET + [ks.BENCHMARK]) <= set(prices.columns)
-    assert len(prices.dropna()) >= ks.MIN_MONTHS
+    assert prices.notna().sum().min() >= ks.MIN_MONTHS, prices.notna().sum()
 
 
 def test_yahoo_latest_prices():
