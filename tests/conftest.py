@@ -66,7 +66,7 @@ def offline(monkeypatch):
     import yfinance as yf
     monkeypatch.setattr(yf, "download", fake_download)
     monkeypatch.setattr(yf, "Ticker", FakeTicker)
-    monkeypatch.setattr(ks, "get_risk_free_rate", lambda: (0.045, "test"))
+    monkeypatch.setattr(ks, "get_risk_free_rate", lambda horizon=3.0: (0.045, "test"))
     monkeypatch.setattr(ks, "get_sp500_constituents", lambda: CONSTITUENTS.copy())
     monkeypatch.setattr(ks.time, "sleep", lambda s: None)
     monkeypatch.setattr(ks, "log", lambda m: None)

@@ -70,3 +70,10 @@ def test_saved_results_carry_name_and_sector(tmp_path, monkeypatch):
     assert w.at["NVDA", "name"] == "Nvidia"                      # from the S&P 500 list
     assert w.at["ASML", "name"] == "ASML Inc"                    # from Yahoo
     assert w.at["ASML", "sector"] == "Information Technology"    # in GICS terms
+
+
+def test_neutral_flag_runs_and_says_so(tmp_path, monkeypatch, capsys):
+    (tmp_path / "views.csv").write_text(EXAMPLE)
+    assert run(tmp_path, monkeypatch, "NVDA", "ASML", "KO", "VOO", "--neutral",
+               "--no-save") == 0
+    assert "Neutral mode" in capsys.readouterr().out

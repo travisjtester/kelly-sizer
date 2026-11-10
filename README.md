@@ -46,6 +46,9 @@ python kelly.py --screen --extra TSM ASML              # opt-in: S&P 500 no-edge
 | Max invested | Settings | `--max-invested` | 1.0 (no margin) |
 | Correlation shrinkage | Settings | `--shrink` | 0.20 |
 | Long-run market return (CAPM) | Settings | `--market-return` | 10.68% |
+| Neutral inputs (test mode) | Settings | `--neutral` | off |
+
+**Neutral inputs** scales each view so its expected return equals its CAPM return while keeping its shape (the spread between bear, base and bull). With the edge removed, sizes should land near the no-views baseline; whatever gap remains is the scenario shape alone. Use it to test a set of inputs, such as analyst targets, not to size.
 
 ## Your views
 ```csv
@@ -62,11 +65,13 @@ KO,0.10,0.15,,,0.30,,"Two outcomes only: base left blank"
 | `bull` | Gain if you're right (`1.0` = +100%) |
 | `value` | Optional intrinsic value per share. If `bull` is blank, bull = value ÷ current price − 1; output shows **margin of safety** = 1 − price ÷ value |
 | `notes` | Optional |
+| `as_of_price` | Optional: the share price your returns were measured from. Scenario **prices** are held fixed and returns re-measured from today's price, so a stale view re-anchors itself (set at $100 with a 30% bear, the bear price is $70; at $90 that reads as a 22% bear). If the price has already run through your bear or bull price, the view falls back to CAPM with a note. Views typed in the app are stamped with the day's price |
+| `horizon` | Optional: years the view assumes (`1` for 12-month targets). If it differs from the run's horizon you get a warning; returns aren't rescaled |
 
 Bull odds = `1 − p_bear − p_base`. **Units:** use one style per file. The odds columns decide it: odds written as percents (`40`) mean the whole file is percents; decimals (`0.4`) mean decimals. A `%` sign always means percent. Older `p_win, upside, downside` files still load. Start from `views.example.csv`.
 
 ## How it sizes
-1. Each name gets a distribution of horizon returns: your scenarios where you have a view; otherwise **CAPM** (10Y Treasury + beta × market premium, lognormal with historical volatility).
+1. Each name gets a distribution of horizon returns: your scenarios where you have a view; otherwise **CAPM** (horizon-matched Treasury + beta × market premium, lognormal with historical volatility).
 2. 20,000 joint outcomes are drawn with a Gaussian copula on historical correlations, so correlated names tend to land on the same side.
 3. Weights maximize **expected log wealth** at the horizon, long-only, within your caps; the rest earns the risk-free rate. A mix that could wipe out the portfolio scores −∞, so the result **never risks ruin**.
 4. **Fractional Kelly** c = bet c × what Kelly says, *then* apply your caps.
@@ -129,7 +134,7 @@ Solo Kelly for every S&P 500 name under CAPM (plus `--extra` names and your view
 pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest            # ~4 minutes, offline
 ```
-Run the tests before merging a branch. Data sources: constituents from Wikipedia (GitHub dataset fallback); 10Y Treasury from FRED (Yahoo `^TNX`, then 4.5% fallback); prices from Yahoo via yfinance (monthly for correlations, daily for current prices). Update `MARKET_RETURN` in `kelly.py` once a year.
+Run the tests before merging a branch. Data sources: constituents from Wikipedia (GitHub dataset fallback); the Treasury yield whose maturity is nearest the horizon (1, 2, 3, 5, 7 or 10 years) from FRED (Yahoo `^FVX`/`^TNX`, then 4.5% fallback); prices from Yahoo via yfinance (monthly for correlations, daily for current prices). Update `MARKET_RETURN` in `kelly.py` once a year.
 
 ## Operational notes
 - **FRED timeouts** are common from scripts; the fallback is the same 10Y yield.
@@ -139,7 +144,8 @@ Run the tests before merging a branch. Data sources: constituents from Wikipedia
 
 ## Caveats
 - **Your inputs are the whole game.** Kelly sizes on the edge you give it: overconfident odds or an understated bear case produce oversized bets (Thorp, p. 105). Use half or quarter Kelly until the journal says your odds deserve more.
-- Scenarios simplify a real distribution, and all views share one horizon.
+- Scenarios simplify a real distribution, and all views share one horizon (a view's `horizon` column flags a mismatch but can't give it its own).
+- Cash earns a horizon-matched Treasury. The book's Kelly formula takes cash at zero, so this is the tool's extension.
 - Correlations between theses come from how the stocks' prices moved together. For idiosyncratic theses that likely overstates the link; raise the shrinkage.
 - Extras (e.g. TSM, ASML ADRs) are priced in USD, so FX is in their returns.
 - Not financial advice.
