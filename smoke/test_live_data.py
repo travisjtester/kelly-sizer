@@ -17,10 +17,22 @@ import kelly as ks  # noqa: E402
 BASKET = ["AAPL", "MSFT", "KO"]
 
 
-@pytest.mark.parametrize("horizon, series", [(1, "DGS1"), (3, "DGS3"), (10, "DGS10")])
-def test_fred_treasury_yields(horizon, series):
+@pytest.mark.parametrize("years", [1, 3, 10])
+def test_fred_treasury_yields(years):
+    assert 0 < ks._fred_yield(ks.FRED_TREASURIES[years]) < 0.20
+
+
+@pytest.mark.parametrize("years", [1, 3, 10])
+def test_treasury_gov_yields(years):
+    assert 0 < ks._treasury_yield(years) < 0.20
+
+
+@pytest.mark.parametrize("horizon, years", [(2, 2), (3, 3)])
+def test_risk_free_is_horizon_matched(horizon, years):
+    """Whichever source answers, the rate must match the horizon: the Yahoo
+    fallback only has 5- and 10-year yields."""
     rf, source = ks.get_risk_free_rate(horizon)
-    assert source == f"FRED {series}", f"fell back to {source}"
+    assert source in (f"FRED {ks.FRED_TREASURIES[years]}", f"Treasury.gov {years} Yr"), source
     assert 0 < rf < 0.20
 
 

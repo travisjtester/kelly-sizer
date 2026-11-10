@@ -111,12 +111,18 @@ def get_sp500_constituents() -> pd.DataFrame:
     return out
 
 
-# Constant-maturity Treasury yields on FRED, by years to maturity. Cash over a
-# buy-and-hold horizon should earn the Treasury that matures with it. (The
-# book's Kelly formula takes cash at zero; a horizon-matched Treasury is the
-# tool's extension.) Yahoo carries only a few maturities, used as a fallback.
+# Cash over a buy-and-hold horizon should earn the Treasury that matures with
+# it. (The book's Kelly formula takes cash at zero; a horizon-matched Treasury
+# is the tool's extension.) Sources, in order: FRED's constant-maturity series,
+# then the Treasury's own daily par yield curve (same maturities), then Yahoo,
+# which carries only the 5- and 10-year, then a constant.
 FRED_TREASURIES = {1: "DGS1", 2: "DGS2", 3: "DGS3", 5: "DGS5", 7: "DGS7", 10: "DGS10"}
+TREASURY_URL = ("https://home.treasury.gov/resource-center/data-chart-center/interest-rates/"
+                "daily-treasury-rates.csv/{year}/all?type=daily_treasury_yield_curve"
+                "&field_tdr_date_value={year}&page&_format=csv")
 YAHOO_TREASURIES = {5: "^FVX", 10: "^TNX"}
+RATE_TIMEOUT = 20        # seconds; FRED can be slow to answer from cloud hosts
+RATE_TRIES = 2
 
 
 def _nearest_maturity(horizon: float, maturities) -> int:
@@ -124,17 +130,51 @@ def _nearest_maturity(horizon: float, maturities) -> int:
     return min(maturities, key=lambda m: (abs(m - horizon), -m))
 
 
+def _get(url: str) -> str:
+    """GET with a generous timeout and one retry."""
+    for attempt in range(RATE_TRIES):
+        try:
+            r = requests.get(url, headers=UA, timeout=RATE_TIMEOUT)
+            r.raise_for_status()
+            return r.text
+        except Exception:
+            if attempt == RATE_TRIES - 1:
+                raise
+            time.sleep(2)
+
+
+def _fred_yield(series: str) -> float:
+    s = pd.read_csv(io.StringIO(_get(FRED_URL.replace("DGS10", series)))).iloc[:, 1]
+    return float(pd.to_numeric(s, errors="coerce").dropna().iloc[-1]) / 100
+
+
+def _treasury_yield(years: int) -> float:
+    """Latest par yield for one maturity from home.treasury.gov (one CSV per
+    year; early January falls back to last year's)."""
+    col = f"{years} Yr"
+    for year in (date.today().year, date.today().year - 1):
+        df = pd.read_csv(io.StringIO(_get(TREASURY_URL.format(year=year))))
+        if col not in df.columns or "Date" not in df.columns:
+            continue
+        df["Date"] = pd.to_datetime(df["Date"], format="%m/%d/%Y", errors="coerce")
+        s = pd.to_numeric(df.sort_values("Date")[col], errors="coerce").dropna()
+        if len(s):
+            return float(s.iloc[-1]) / 100
+    raise ValueError(f"no {col} yields found")
+
+
 def get_risk_free_rate(horizon: float = DEFAULT_HORIZON) -> tuple[float, str]:
     """Treasury yield matched to the horizon, as a decimal, plus the source used."""
-    series = FRED_TREASURIES[_nearest_maturity(horizon, FRED_TREASURIES)]
+    years = _nearest_maturity(horizon, FRED_TREASURIES)
+    series = FRED_TREASURIES[years]
     try:
-        r = requests.get(FRED_URL.replace("DGS10", series), headers=UA, timeout=8)
-        r.raise_for_status()
-        s = pd.read_csv(io.StringIO(r.text)).iloc[:, 1]
-        s = pd.to_numeric(s, errors="coerce").dropna()
-        return float(s.iloc[-1]) / 100, f"FRED {series}"
+        return _fred_yield(series), f"FRED {series}"
     except Exception as e:
-        log(f"FRED {series} failed ({e}); trying Yahoo...")
+        log(f"FRED {series} failed ({e}); trying Treasury.gov...")
+    try:
+        return _treasury_yield(years), f"Treasury.gov {years} Yr"
+    except Exception as e:
+        log(f"Treasury.gov {years} Yr failed ({e}); trying Yahoo...")
     symbol = YAHOO_TREASURIES[_nearest_maturity(horizon, YAHOO_TREASURIES)]
     try:
         import yfinance as yf
