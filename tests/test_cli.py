@@ -58,3 +58,15 @@ def test_no_args_and_no_views_shows_help(tmp_path, monkeypatch, capsys):
 def test_warns_above_book_ceiling(tmp_path, monkeypatch, capsys):
     run(tmp_path, monkeypatch, "KO", "MSFT", "--max-weight", "0.6", "--no-save")
     assert "above the book's 40% ceiling" in capsys.readouterr().out
+
+
+def test_yahoo_sectors_map_to_gics():
+    assert ks.lookup_extra_meta(["ASML"]).sector.iloc[0] == "Information Technology"
+
+
+def test_saved_results_carry_name_and_sector(tmp_path, monkeypatch):
+    assert run(tmp_path, monkeypatch, "NVDA", "ASML", "KO", "VOO") == 0
+    w = pd.read_csv(next((tmp_path / "out").glob("kelly_portfolio_2*.csv"))).set_index("ticker")
+    assert w.at["NVDA", "name"] == "Nvidia"                      # from the S&P 500 list
+    assert w.at["ASML", "name"] == "ASML Inc"                    # from Yahoo
+    assert w.at["ASML", "sector"] == "Information Technology"    # in GICS terms

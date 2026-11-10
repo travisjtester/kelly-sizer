@@ -78,3 +78,19 @@ def test_journal_log_and_calibration(app):
     assert {d.label for d in at.get("download_button")} >= {"Save views CSV",
                                                            "Save journal CSV",
                                                            "Save these results (CSV)"}
+
+
+def test_loaded_views_join_the_basket(app):
+    app.session_state["_add_picks"] = ["TSM", "SNOW"]           # what an upload queues
+    at = app.run()
+    picks = at.multiselect[0].value
+    assert picks[:2] == ["TSM", "SNOW"] and "NVDA" in picks      # added, defaults kept
+    assert not at.exception
+
+
+def test_loaded_views_past_the_cap_are_named(app):
+    many = [f"T{i:02d}" for i in range(14)]
+    app.session_state["_add_picks"] = many
+    at = app.run()
+    assert at.multiselect[0].value == many + ["NVDA"]            # 15: the file first
+    assert any("didn't fit" in w.value and "ASML" in w.value for w in at.warning)

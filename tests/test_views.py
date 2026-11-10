@@ -74,3 +74,23 @@ def test_no_unfaithful_columns(prices):
     for gone in ["cagr_gap", "performance_category", "sharpe_capm"]:
         assert gone not in res.columns
     assert "sharpe" not in s.columns
+
+
+def _bears(*bears):
+    return pd.DataFrame({"ticker": [f"T{i}" for i in range(len(bears))],
+                         "p_bear": [.2] * len(bears), "bear": list(bears),
+                         "bull": [.5] * len(bears)})
+
+
+def test_mixed_bear_signs_warn_and_name_the_odd_rows():
+    with ks.captured_log() as notes:
+        v = ks.normalize_views(_bears(-.3, -.4, .2))
+    assert any("bear signs are mixed" in n and "T2" in n and "T0" not in n for n in notes)
+    assert (v.bear > 0).all()                      # still read as a loss: a warning, not an error
+
+
+@pytest.mark.parametrize("bears", [(-.3, -.4, -.2), (.3, .4, .2)])
+def test_consistent_bear_signs_stay_quiet(bears):
+    with ks.captured_log() as notes:
+        ks.normalize_views(_bears(*bears))
+    assert not any("bear signs" in n for n in notes)
