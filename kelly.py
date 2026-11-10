@@ -7,7 +7,8 @@ The phone app (app.py) runs the same engine.
 
 Pipeline
   1. Constituents  : Wikipedia (browser UA) -> GitHub datasets CSV fallback
-  2. Risk-free rate: FRED DGS10 (no API key) -> Yahoo ^TNX fallback -> constant
+  2. Risk-free rate: FRED Treasury matched to the horizon (DGS1..DGS10, no API
+                     key) -> Yahoo ^FVX/^TNX fallback -> constant
   3. Prices        : ONE bulk yfinance download of monthly closes (auto-adjusted)
                      for every ticker + ^GSPC, in chunks, with retries
   4. Your views    : optional bear / base / bull scenarios per name (bear =
@@ -110,22 +111,37 @@ def get_sp500_constituents() -> pd.DataFrame:
     return out
 
 
-def get_risk_free_rate() -> tuple[float, str]:
-    """10-Year Treasury yield as a decimal, plus the source used."""
+# Constant-maturity Treasury yields on FRED, by years to maturity. Cash over a
+# buy-and-hold horizon should earn the Treasury that matures with it. (The
+# book's Kelly formula takes cash at zero; a horizon-matched Treasury is the
+# tool's extension.) Yahoo carries only a few maturities, used as a fallback.
+FRED_TREASURIES = {1: "DGS1", 2: "DGS2", 3: "DGS3", 5: "DGS5", 7: "DGS7", 10: "DGS10"}
+YAHOO_TREASURIES = {5: "^FVX", 10: "^TNX"}
+
+
+def _nearest_maturity(horizon: float, maturities) -> int:
+    """The maturity closest to the horizon; a tie goes to the longer one."""
+    return min(maturities, key=lambda m: (abs(m - horizon), -m))
+
+
+def get_risk_free_rate(horizon: float = DEFAULT_HORIZON) -> tuple[float, str]:
+    """Treasury yield matched to the horizon, as a decimal, plus the source used."""
+    series = FRED_TREASURIES[_nearest_maturity(horizon, FRED_TREASURIES)]
     try:
-        r = requests.get(FRED_URL, headers=UA, timeout=8)
+        r = requests.get(FRED_URL.replace("DGS10", series), headers=UA, timeout=8)
         r.raise_for_status()
         s = pd.read_csv(io.StringIO(r.text)).iloc[:, 1]
         s = pd.to_numeric(s, errors="coerce").dropna()
-        return float(s.iloc[-1]) / 100, "FRED DGS10"
+        return float(s.iloc[-1]) / 100, f"FRED {series}"
     except Exception as e:
-        log(f"FRED failed ({e}); trying Yahoo ^TNX...")
+        log(f"FRED {series} failed ({e}); trying Yahoo...")
+    symbol = YAHOO_TREASURIES[_nearest_maturity(horizon, YAHOO_TREASURIES)]
     try:
         import yfinance as yf
-        h = yf.Ticker("^TNX").history(period="5d")["Close"].dropna()
-        return float(h.iloc[-1]) / 100, "Yahoo ^TNX"
+        h = yf.Ticker(symbol).history(period="5d")["Close"].dropna()
+        return float(h.iloc[-1]) / 100, f"Yahoo {symbol}"
     except Exception as e:
-        log(f"^TNX failed ({e}); using fallback {FALLBACK_RF:.2%}")
+        log(f"{symbol} failed ({e}); using fallback {FALLBACK_RF:.2%}")
     return FALLBACK_RF, "fallback constant"
 
 
@@ -199,6 +215,11 @@ def download_latest_prices(tickers: list[str]) -> dict[str, float]:
 # The bull return can be given directly or derived from an intrinsic value
 # estimate: bull = value / price - 1 (margin of safety = 1 - price / value).
 VIEW_COLS = ["p_bear", "bear", "p_base", "base", "bull", "value"]
+# Optional context for a view. as_of_price: the share price the returns were
+# measured from; the scenario PRICES are held fixed and the returns re-measured
+# from today's price (stale views re-anchor themselves). horizon: the years the
+# view assumes; a mismatch with the run's horizon is flagged, not rescaled.
+VIEW_CONTEXT_COLS = ["as_of_price", "horizon"]
 LEGACY_VIEW_COLS = ["p_win", "upside", "downside"]
 
 UNIT_COLS = ["p_bear", "p_base", "p_bull", "bear", "p_win", "downside"]   # always <= 1 as decimals
@@ -249,7 +270,7 @@ def normalize_views(df: pd.DataFrame | None) -> pd.DataFrame:
     value) or the older binary format (p_win, upside, downside). Rows without
     a usable bear case and a bull return or value are ignored (CAPM is used).
     """
-    cols = VIEW_COLS + ["p_bull", "notes"]
+    cols = VIEW_COLS + ["p_bull", "notes"] + VIEW_CONTEXT_COLS
     empty = pd.DataFrame(columns=cols).rename_axis("ticker")
     if df is None or df.empty:
         return empty
@@ -280,6 +301,11 @@ def normalize_views(df: pd.DataFrame | None) -> pd.DataFrame:
             d[c] = _column_to_fraction(d[c], as_pct)
     d["value"] = pd.to_numeric(d["value"].astype(str).str.replace(r"[$,]", "", regex=True),
                                errors="coerce")
+    for c in VIEW_CONTEXT_COLS:            # optional; blank, zero or junk = not given
+        raw = d[c] if c in d.columns else pd.Series(np.nan, index=d.index)
+        num = pd.to_numeric(raw.astype(str).str.replace(r"[$,]", "", regex=True),
+                            errors="coerce")
+        d[c] = num.where(num > 0)
     _warn_mixed_bear_signs(d)
     d["bear"] = d["bear"].abs()     # a loss either way: -0.30 and 0.30 both mean lose 30%
     d["p_base"] = d["p_base"].fillna(0.0)
@@ -320,15 +346,73 @@ def resolve_views(views: pd.DataFrame, prices_now: dict[str, float]) -> pd.DataF
     """
     v = normalize_views(views).copy()
     v["price"] = [prices_now.get(t, np.nan) for t in v.index]
+    breached = _reanchor(v)
     v["margin_of_safety"] = 1 - v["price"] / v["value"]
     need = v["bull"].isna()
     v.loc[need, "bull"] = v.loc[need, "value"] / v.loc[need, "price"] - 1
-    unusable = v[v["bull"].isna() | (v["bull"] <= 0)]
+    unusable = v[v["bull"].isna() | (v["bull"] <= 0)].drop(index=list(breached), errors="ignore")
     for t, r in unusable.iterrows():
-        why = ("no current price to compare with its value" if pd.isna(r["price"])
-               else f"value ${r['value']:,.2f} is below the price ${r['price']:,.2f}: no upside")
+        if pd.isna(r["price"]):
+            why = "no current price to compare with its value"
+        elif need[t]:
+            why = f"value ${r['value']:,.2f} is below the price ${r['price']:,.2f}: no upside"
+        else:
+            why = f"the price ${r['price']:,.2f} is already past your bull case: no upside"
         log(f"Views: ignoring {t} ({why}); it falls back to CAPM")
-    return v.drop(index=unusable.index)
+    for t, bear_px in breached.items():
+        log(f"Views: ignoring {t} (the price ${v.at[t, 'price']:,.2f} is already at or "
+            f"below your bear price ${bear_px:,.2f}; revisit the view); it falls back to CAPM")
+    return v.drop(index=unusable.index.union(list(breached)))
+
+
+REANCHOR_NOTE = 0.05    # mention a re-anchored view once the price has moved 5%+
+
+
+def _reanchor(v: pd.DataFrame) -> dict[str, float]:
+    """
+    Views with an as_of_price: hold each scenario's PRICE fixed and re-measure
+    its return from today's price, in place. A view written at $100 with a 30%
+    bear (bear price $70) reads as a 22% bear once the stock is $90. A bull
+    given as a return is re-anchored the same way; one given as value already
+    uses today's price. Returns {ticker: bear price} for views whose bear price
+    the stock has already fallen through, which can't be sized as written.
+    """
+    k = v["as_of_price"] / v["price"]
+    breached = {}
+    for t in v.index[k.notna() & np.isfinite(k)]:
+        r, kk = v.loc[t], k[t]
+        bear_px = r["as_of_price"] * (1 - r["bear"])
+        v.at[t, "bear"] = 1 - kk * (1 - r["bear"])
+        if pd.notna(r["base"]):
+            v.at[t, "base"] = kk * (1 + r["base"]) - 1
+        if pd.notna(r["bull"]):
+            v.at[t, "bull"] = kk * (1 + r["bull"]) - 1
+        if v.at[t, "bear"] <= 0:
+            breached[t] = bear_px
+        elif abs(kk - 1) >= REANCHOR_NOTE:
+            log(f"Views: {t} has moved {1 / kk - 1:+.0%} since your view at "
+                f"${r['as_of_price']:,.2f}; scenario prices held, returns re-measured "
+                f"from ${r['price']:,.2f}")
+    return breached
+
+
+def neutralize_view(v: pd.Series, target_return: float) -> pd.Series:
+    """
+    Neutral mode, for testing inputs: keep a view's shape (the spread between
+    bear, base and bull) but scale every outcome so its expected return over
+    the horizon equals target_return (the name's CAPM return). With the edge
+    gone, sizes should land near the CAPM baseline; what's left is the effect
+    of the scenario shape alone. Gross returns are scaled, so outcomes keep
+    their order and never go below -100%.
+    """
+    probs, rets = view_outcomes(v)
+    m = (1 + target_return) / (1 + float(probs @ rets))
+    v = v.copy()
+    v["bear"] = 1 - (1 - v["bear"]) * m        # may turn into a small gain: that's the shape
+    if v["p_base"] > 0:
+        v["base"] = (1 + v["base"]) * m - 1
+    v["bull"] = (1 + v["bull"]) * m - 1
+    return v
 
 
 def view_outcomes(v: pd.Series) -> tuple[np.ndarray, np.ndarray]:
@@ -407,9 +491,12 @@ def compute_kelly(prices: pd.DataFrame, rf: float, market_return: float,
                   benchmark: str = BENCHMARK,
                   views: pd.DataFrame | None = None,
                   horizon: float = DEFAULT_HORIZON,
-                  prices_now: dict[str, float] | None = None) -> pd.DataFrame:
+                  prices_now: dict[str, float] | None = None,
+                  neutral: bool = False) -> pd.DataFrame:
     """
     Per-name solo Kelly over the horizon (buy and hold, versus cash).
+    neutral=True reshapes each view to its CAPM expected return (see
+    neutralize_view): a test mode that removes the edge but keeps the shape.
 
     CAPM supplies the edge by default: expected return = Rf + beta * MRP,
     outcomes lognormal with historical volatility. A name with a view uses
@@ -422,6 +509,7 @@ def compute_kelly(prices: pd.DataFrame, rf: float, market_return: float,
     if len(views):
         last_close = prices.ffill().iloc[-1].to_dict() if len(prices) else {}
         views = resolve_views(views, {**last_close, **(prices_now or {})})
+        _warn_horizon_mismatch(views, horizon)
     rf_h = (1 + rf) ** horizon - 1
     mrp = market_return - rf
     rets = prices.pct_change(fill_method=None)
@@ -436,6 +524,9 @@ def compute_kelly(prices: pd.DataFrame, rf: float, market_return: float,
         has_view = t in views.index
         if len(r) < MIN_MONTHS:
             if has_view:
+                if neutral:
+                    log(f"Neutral mode: {t} has too little history for a CAPM return, "
+                        "so its view is sized as entered")
                 rows.append({"ticker": t, "months_of_data": len(r),
                              **view_stats(views.loc[t], rf, horizon),
                              "status": "ok"})
@@ -469,9 +560,24 @@ def compute_kelly(prices: pd.DataFrame, rf: float, market_return: float,
             "status": "ok",
         }
         if has_view:
-            row.update(view_stats(views.loc[t], rf, horizon))
+            v = views.loc[t]
+            if neutral:
+                v = neutralize_view(v, (1 + exp_ret) ** horizon - 1)
+            row.update(view_stats(v, rf, horizon))
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def _warn_horizon_mismatch(views: pd.DataFrame, horizon: float) -> None:
+    """Views carry no time scale of their own: a 12-month target run over a
+    3-year hold compares one year of upside with three years of cash. Flag
+    views whose stated horizon differs from the run's."""
+    off = views[views["horizon"].notna() & ((views["horizon"] - horizon).abs() > 1e-9)]
+    if len(off):
+        names = ", ".join(f"{t} ({h:g}y)" for t, h in off["horizon"].items())
+        log(f"Views: some views assume a different horizon: {names}. This run is {horizon:g} "
+            f"years and their returns aren't rescaled; set the horizon to match or "
+            f"restate those views.")
 
 
 # ------------------------------------------------------------ portfolio ---
@@ -694,6 +800,7 @@ def what_if_wrong(prices: pd.DataFrame, tickers: list[str], rf: float,
                   max_leverage: float = PORTFOLIO_MAX_LEVERAGE,
                   shrink: float = COV_SHRINK,
                   n_scenarios: int = N_SCENARIOS,
+                  neutral: bool = False,
                   ) -> tuple[pd.DataFrame, pd.DataFrame] | None:
     """
     Returns (by_name, held) or None when no name has a view.
@@ -711,7 +818,8 @@ def what_if_wrong(prices: pd.DataFrame, tickers: list[str], rf: float,
         f"Bear loss {STRESS_LOSS:g}x deeper": stress_views(views, 0.0, STRESS_LOSS),
     }
     kw = dict(market_return=market_return, horizon=horizon, max_weight=max_weight,
-              max_leverage=max_leverage, shrink=shrink, n_scenarios=n_scenarios)
+              max_leverage=max_leverage, shrink=shrink, n_scenarios=n_scenarios,
+              neutral=neutral)
     rf_h = (1 + rf) ** horizon - 1
     corr, _ = _correlation(prices, basket, shrink)
 
@@ -719,7 +827,7 @@ def what_if_wrong(prices: pd.DataFrame, tickers: list[str], rf: float,
     held = []
     with captured_log():
         res0 = compute_kelly(prices, rf, market_return, views=views, horizon=horizon,
-                             prices_now=prices_now).set_index("ticker")
+                             prices_now=prices_now, neutral=neutral).set_index("ticker")
         X0 = simulate_outcomes(res0, basket, corr, horizon, n_scenarios) - rf_h
         held.append({"scenario": "As you entered it",
                      **basket_stats(mine.values, X0, rf_h, horizon)})
@@ -907,10 +1015,14 @@ def size_basket(prices: pd.DataFrame, tickers: list[str], rf: float,
                 max_leverage: float = PORTFOLIO_MAX_LEVERAGE,
                 shrink: float = COV_SHRINK,
                 n_scenarios: int = N_SCENARIOS,
+                neutral: bool = False,
                 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Per-name stats, then joint Kelly weights. Returns (results, weights, summary)."""
+    if neutral:
+        log("Neutral mode: each view keeps its shape but is scaled to its CAPM return, "
+            "so there's no edge. A test of your inputs, not a sizing.")
     results = compute_kelly(prices, rf, market_return, views=views,
-                            horizon=horizon, prices_now=prices_now)
+                            horizon=horizon, prices_now=prices_now, neutral=neutral)
     missing = [t for t in tickers if t not in prices.columns]
     if missing:
         results = pd.concat([results, pd.DataFrame({"ticker": missing,
@@ -989,8 +1101,16 @@ def fractions_table(weights: pd.DataFrame, summary: pd.DataFrame) -> tuple[pd.Da
     return wide.set_index("Ticker"), stats
 
 
-def run_note(summary: pd.DataFrame, rf: float, rf_source: str, logs: list[str]) -> str:
-    notes = [m.split(": ", 1)[1] for m in logs if m.startswith(("Portfolio:", "Views:"))]
+def view_notes(logs: list[str]) -> list[str]:
+    """Engine notes about your views (re-anchored, ignored, wrong horizon)."""
+    return [m.split(": ", 1)[1] for m in logs if m.startswith("Views:")]
+
+
+def run_note(summary: pd.DataFrame, rf: float, rf_source: str, logs: list[str],
+             include_views: bool = True) -> str:
+    keep = ("Portfolio:", "Views:") if include_views else ("Portfolio:",)
+    notes = [m.split(": ", 1)[1] for m in logs if m.startswith(keep)]
+    notes += [m for m in logs if m.startswith("Neutral mode")]
     return (f"Risk-free {rf:.2%} ({rf_source}) · {int(summary['months_used'].iloc[0])} "
             f"months of price history for correlations"
             + (f" · {'; '.join(notes)}" if notes else ""))
@@ -1163,6 +1283,9 @@ def main(argv: list[str] | None = None) -> int:
                    help=f"Correlation shrinkage toward independence (default {COV_SHRINK:g})")
     s.add_argument("--market-return", type=float, default=MARKET_RETURN,
                    help=f"Long-run market return for CAPM names (default {MARKET_RETURN})")
+    s.add_argument("--neutral", action="store_true",
+                   help="Test mode: scale each view to its CAPM return, keeping its shape "
+                        "(no edge). Sizes should land near the no-views baseline")
     s.add_argument("--scenarios", type=int, default=N_SCENARIOS, help=argparse.SUPPRESS)
 
     r = p.add_argument_group("your research")
@@ -1209,7 +1332,7 @@ def main(argv: list[str] | None = None) -> int:
     if len(views):
         print(f"Using your views from {args.views}: {', '.join(views.index)}")
 
-    rf, rf_source = get_risk_free_rate()
+    rf, rf_source = get_risk_free_rate(args.horizon)
 
     # ---- the no-edge baseline (opt-in)
     if args.screen:
@@ -1246,7 +1369,7 @@ def main(argv: list[str] | None = None) -> int:
                 prices_now=prices_now, meta=meta, market_return=args.market_return,
                 horizon=args.horizon, max_weight=args.max_weight,
                 max_leverage=args.max_invested, shrink=args.shrink,
-                n_scenarios=args.scenarios)
+                n_scenarios=args.scenarios, neutral=args.neutral)
     except ValueError as e:
         print(f"Can't size this basket: {e}")
         return 2
@@ -1267,7 +1390,8 @@ def main(argv: list[str] | None = None) -> int:
                         weights, frac, prices_now=prices_now,
                         market_return=args.market_return, horizon=args.horizon,
                         max_weight=args.max_weight, max_leverage=args.max_invested,
-                        shrink=args.shrink, n_scenarios=args.scenarios)
+                        shrink=args.shrink, n_scenarios=args.scenarios,
+                        neutral=args.neutral)
     if wiw is not None:
         by_name, held = wiw
         print("\nWhat if I'm wrong?")

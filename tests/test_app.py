@@ -31,7 +31,7 @@ def test_capm_only_basket(app):
     assert any("every name uses CAPM" in i.value for i in at.info)
     labels = [m.label for m in at.metric]
     assert labels[:3] == ["Chance of loss (3y)", "Worst case, 1-in-20 (3y)", "Exp. growth"]
-    assert len(at.toggle) == 0                   # no backtest
+    assert not any("backtest" in t.label.lower() for t in at.toggle)   # no backtest
     assert any("Add your research to see how sensitive" in c.value for c in at.caption)
 
 
@@ -94,3 +94,20 @@ def test_loaded_views_past_the_cap_are_named(app):
     at = app.run()
     assert at.multiselect[0].value == many + ["NVDA"]            # 15: the file first
     assert any("didn't fit" in w.value and "ASML" in w.value for w in at.warning)
+
+
+def test_neutral_mode_warns_that_it_is_a_test(app):
+    app.session_state["views"] = {
+        "NVDA": {"p_bear": .25, "bear": .5, "p_base": .35, "base": .15, "bull": 1.0, "value": None}}
+    next(t for t in app.toggle if t.label.startswith("Neutral")).set_value(True)
+    at = size(app)
+    assert any("Neutral inputs is on" in w.value for w in at.warning)
+
+
+def test_untouched_view_keeps_its_price_and_horizon(app):
+    at = size(app)
+    at.session_state["views"] = {        # as an upload stores it; the table leaves it be
+        "NVDA": {"p_bear": .25, "bear": .5, "p_base": .35, "base": .15, "bull": 1.0,
+                 "value": None, "as_of_price": 123.0, "horizon": 1.0}}
+    at.run()
+    assert at.session_state["views"]["NVDA"]["as_of_price"] == 123.0

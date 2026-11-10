@@ -36,7 +36,10 @@ if _mtime != _loaded["mtime"] or not hasattr(ks, "size_basket"):
 
 FRACTIONS = {"Full": "full", "Half": "half", "Quarter": "quarter", "Eighth": "eighth"}
 DEFAULT_TICKERS = ["NVDA", "ASML", "AVGO", "MSFT", "VOO"]
-VIEW_FIELDS = ["p_bear", "bear", "p_base", "base", "bull", "value"]
+VIEW_FIELDS = ["p_bear", "bear", "p_base", "base", "bull", "value"]   # the research table
+# What a stored view carries: the table's fields plus its context (the price it
+# was set at and the horizon it assumes), which the views CSV round-trips.
+STORE_FIELDS = VIEW_FIELDS + ks.VIEW_CONTEXT_COLS
 
 # Brand palette (see .streamlit/config.toml): teal #379A8B, coffee #D1B07C,
 # red #DB444B, grey #D3D3D3. Verdict text uses the same 4.5:1+ shades as the
@@ -57,8 +60,8 @@ def verdict_colors() -> dict:
 
 # ------------------------------------------------------------- cached data ---
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def risk_free() -> tuple[float, str]:
-    return ks.get_risk_free_rate()
+def risk_free(horizon: float) -> tuple[float, str]:
+    return ks.get_risk_free_rate(horizon)
 
 
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
@@ -99,6 +102,12 @@ def latest_for(tickers: tuple[str, ...]) -> dict[str, float]:
     return ks.download_latest_prices(list(tickers))
 
 
+def _same(a, b) -> bool:
+    """Equal table values, treating blanks alike and ignoring display rounding."""
+    a_na, b_na = a is None or pd.isna(a), b is None or pd.isna(b)
+    return (a_na and b_na) or (not a_na and not b_na and abs(float(a) - float(b)) < 1e-6)
+
+
 def _pct(x):
     return None if x is None or pd.isna(x) else round(float(x) * 100, 4)
 
@@ -108,7 +117,7 @@ def _init_views() -> dict:
     """Start from views.csv in the repo if present (git add -f views.csv)."""
     try:
         v = ks.load_views("views.csv")
-        return {t: {k: r[k] for k in VIEW_FIELDS} for t, r in v.iterrows()}
+        return {t: {k: r[k] for k in STORE_FIELDS} for t, r in v.iterrows()}
     except Exception:
         return {}
 
@@ -220,7 +229,13 @@ with st.expander("Your research (views)", expanded=bool(store)):
             continue
         try:
             ks.normalize_views(pd.DataFrame([{"ticker": r["ticker"], **entry}]))
-            store[r["ticker"]] = entry
+            prev = store.get(r["ticker"], {})
+            if prev and all(_same(entry[k], prev.get(k)) for k in VIEW_FIELDS):
+                ctx = {c: prev.get(c) for c in ks.VIEW_CONTEXT_COLS}     # untouched: keep
+            else:   # typed or changed here: anchored at today's price
+                t = r["ticker"]
+                ctx = {"as_of_price": px.get(t) or latest_for((t,)).get(t), "horizon": None}
+            store[r["ticker"]] = {**entry, **ctx}
         except ValueError as e:
             store.pop(r["ticker"], None)
             problems.append(f"**{r['ticker']}**: {e}")
@@ -234,7 +249,7 @@ with st.expander("Your research (views)", expanded=bool(store)):
         try:
             with ks.captured_log() as notes:
                 loaded = ks.normalize_views(pd.read_csv(file))
-            store.update({t: {k: r[k] for k in VIEW_FIELDS} for t, r in loaded.iterrows()})
+            store.update({t: {k: r[k] for k in STORE_FIELDS} for t, r in loaded.iterrows()})
             st.session_state._views_loaded = file.file_id
             st.session_state._add_picks = list(loaded.index)
             st.session_state._upload_notes = list(notes)
@@ -269,6 +284,11 @@ with st.expander("Settings"):
                             "theses are less linked than the stocks' prices.")
     mkt_ret = st.number_input("Long-run market return (CAPM names)", 0.0, 0.30,
                               ks.MARKET_RETURN, 0.005, format="%.4f")
+    neutral = st.toggle(
+        "Neutral inputs (test mode)", value=False,
+        help="Scale each view to its CAPM return while keeping its shape, so there's "
+             "no edge. Sizes should land near the no-views baseline; any gap is the "
+             "scenario shape alone. For testing inputs, not for sizing.")
 
 if st.button("Size it", type="primary", width="stretch"):
     st.session_state.ran = True
@@ -285,7 +305,7 @@ else:
                                               for t, v in in_basket.items()]))
              if in_basket else None)
     with st.spinner("Pulling prices and solving…"):
-        rf, rf_src = risk_free()
+        rf, rf_src = risk_free(horizon)
         prices = prices_for(tuple(sorted(tickers)))
         prices_now = latest_for(tuple(sorted(in_basket))) if in_basket else {}
         if prices.empty or ks.BENCHMARK not in prices.columns:
@@ -296,7 +316,8 @@ else:
                     results, weights, summary = ks.size_basket(
                         prices, tickers, rf, views=views, prices_now=prices_now,
                         meta=meta_for(tickers), market_return=mkt_ret, horizon=horizon,
-                        max_weight=max_weight, max_leverage=max_lev, shrink=shrink)
+                        max_weight=max_weight, max_leverage=max_lev, shrink=shrink,
+                        neutral=neutral)
                 results_ready = True
             except ValueError as e:
                 st.error(str(e))
@@ -305,6 +326,11 @@ if results_ready:
     frac = FRACTIONS[fraction_label]
     n_views = int(summary["views_used"].iloc[0])
     (st.success if n_views else st.info)(ks.basket_message(summary))
+    for note in ks.view_notes(logs):      # re-anchored, ignored, or the wrong horizon
+        st.warning(note)
+    if neutral and n_views:
+        st.warning("Neutral inputs is on: your views are scaled to CAPM returns (no "
+                   "edge). Use this to test inputs; turn it off to size for real.")
 
     # ---- headline (shared with the CLI): permanent-loss risk first
     stats = ks.headline(summary, frac)
@@ -322,17 +348,17 @@ if results_ready:
         tbl, hide_index=True, width="stretch",
         column_config={
             "ticker": st.column_config.TextColumn("Ticker", pinned=True),
-            "weight": st.column_config.ProgressColumn("Weight", format="percent",
+            "weight": st.column_config.ProgressColumn("Weight", format="percent", step=0.001,
                                                       min_value=0, max_value=1),
             "dollars": st.column_config.NumberColumn("$", format="$%,.0f"),
             "edge": st.column_config.TextColumn("Edge"),
             "margin_of_safety": st.column_config.NumberColumn(
-                "MoS", format="percent", help="Margin of safety"),
+                "MoS", format="percent", step=0.01, help="Margin of safety"),
             "solo_kelly": st.column_config.NumberColumn(
-                "Solo Kelly", format="percent",
+                "Solo Kelly", format="percent", step=0.01,
                 help="This name's Kelly bet on its own: a ceiling, not a target"),
             "swing": st.column_config.NumberColumn(
-                "Swing", format="percent",
+                "Swing", format="percent", step=0.01,
                 help="Annual price volatility: how bumpy, not how risky"),
         },
     )
@@ -341,7 +367,7 @@ if results_ready:
     st.subheader(":red[What if I'm wrong?]", divider="red")
     wiw = ks.what_if_wrong(prices, tickers, rf, views, weights, frac, prices_now=prices_now,
                            market_return=mkt_ret, horizon=horizon, max_weight=max_weight,
-                           max_leverage=max_lev, shrink=shrink)
+                           max_leverage=max_lev, shrink=shrink, neutral=neutral)
     if wiw is None:
         st.caption("Add your research to see how sensitive the sizing is to your bear "
                    "cases. CAPM names have no view to be wrong about.")
@@ -378,7 +404,7 @@ if results_ready:
         st.dataframe(wide.map(lambda x: f"{x:.1%}"), width="stretch")
         st.dataframe(fstats.map(lambda x: f"{x:.1%}"), width="stretch")
 
-    st.caption(ks.run_note(summary, rf, rf_src, logs))
+    st.caption(ks.run_note(summary, rf, rf_src, logs, include_views=False))
     if not summary["solver_ok"].all():
         st.warning("Optimizer didn't fully converge for some fractions; treat as approximate.")
     st.download_button("Save these results (CSV)", weights.to_csv(index=False),
