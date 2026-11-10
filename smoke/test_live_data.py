@@ -63,3 +63,16 @@ def test_end_to_end_sizing():
                                          prices_now=ks.download_latest_prices(["KO"]))
     assert summary["solver_ok"].all()
     assert abs(weights.filter(like="weight_half").sum().iloc[0] - 1) < 1e-9
+
+
+def test_option_chain_gives_market_odds():
+    """A liquid name's option chain must still parse into usable odds."""
+    import numpy as np
+    spot = ks.download_latest_prices(["AAPL"])["AAPL"]
+    rf, _ = ks.get_risk_free_rate(2)
+    sm = ks.fetch_option_smile("AAPL", spot, 2.0, rf)
+    assert not sm["smile"].empty, sm["note"]
+    assert sm["years"] > 0.5
+    pb, pu, note = ks.implied_odds(sm["smile"], spot, sm["years"], np.log1p(rf),
+                                   spot * 0.7, spot * 1.4)
+    assert 0 < pb < 0.6 and 0 < pu < 0.6, note

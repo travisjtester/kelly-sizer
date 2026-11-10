@@ -98,6 +98,11 @@ def prices_for(tickers: tuple[str, ...]) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def option_smile_for(ticker: str, spot: float, horizon: float, rf: float) -> dict:
+    return ks.fetch_option_smile(ticker, spot, horizon, rf)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def latest_for(tickers: tuple[str, ...]) -> dict[str, float]:
     return ks.download_latest_prices(list(tickers))
 
@@ -289,6 +294,52 @@ with st.expander("Settings"):
         help="Scale each view to its CAPM return while keeping its shape, so there's "
              "no edge. Sizes should land near the no-views baseline; any gap is the "
              "scenario shape alone. For testing inputs, not for sizing.")
+
+# ---- market check: the tote board, revealed only after you've committed
+in_views = {t: v for t, v in store.items() if t in tickers}
+with st.expander("Market check: your odds vs. the market's"):
+    if not in_views:
+        st.caption("Enter your odds under **Your research** first. The market's odds stay "
+                   "hidden until you've committed to your own, so they can't anchor you.")
+    elif st.toggle("Show the market's odds for my views", key="show_market"):
+        with st.spinner("Reading option prices…"):
+            rf_mc, _ = risk_free(horizon)
+            px_mc = latest_for(tuple(sorted(in_views)))
+            mine = ks.normalize_views(pd.DataFrame([{"ticker": t, **v}
+                                                    for t, v in in_views.items()]))
+            smiles = {t: option_smile_for(t, round(px_mc[t], 2), horizon, rf_mc)
+                      for t in mine.index if px_mc.get(t)}
+            check = ks.market_check(mine, px_mc, horizon, rf_mc, smiles)
+        if check.empty:
+            st.info("No current prices for these views yet. Try again in a minute.")
+        else:
+            st.dataframe(
+                check.drop(columns=["years"]), hide_index=True, width="stretch",
+                column_config={
+                    "ticker": st.column_config.TextColumn("Ticker", pinned=True),
+                    "your_bear": st.column_config.NumberColumn(
+                        "Your bear odds", format="percent", step=0.01),
+                    "market_bear": st.column_config.NumberColumn(
+                        "Market", format="percent", step=0.01,
+                        help="Option-implied chance of finishing below your bear price"),
+                    "bear_price": st.column_config.NumberColumn("Bear price", format="$%.2f"),
+                    "your_bull": st.column_config.NumberColumn(
+                        "Your bull odds", format="percent", step=0.01),
+                    "market_bull": st.column_config.NumberColumn(
+                        "Market", format="percent", step=0.01,
+                        help="Option-implied chance of finishing above your bull price"),
+                    "bull_price": st.column_config.NumberColumn("Bull price", format="$%.2f"),
+                    "expiry": st.column_config.TextColumn("Options expiry"),
+                    "note": st.column_config.TextColumn("Note"),
+                })
+            for gap in ks.market_gaps(check):
+                st.info(gap)
+            st.caption(
+                "The market's odds come from option prices at the expiry shown. They're "
+                "*risk-neutral*: they include a risk premium, so downside reads a little high "
+                "and upside a little low. They price a share price on a date, not a broken "
+                "thesis. A gap isn't wrong; it's a claim you should be able to explain. "
+                "These numbers never feed the sizing.")
 
 if st.button("Size it", type="primary", width="stretch"):
     st.session_state.ran = True

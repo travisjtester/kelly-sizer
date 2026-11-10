@@ -77,3 +77,10 @@ def test_neutral_flag_runs_and_says_so(tmp_path, monkeypatch, capsys):
     assert run(tmp_path, monkeypatch, "NVDA", "ASML", "KO", "VOO", "--neutral",
                "--no-save") == 0
     assert "Neutral mode" in capsys.readouterr().out
+
+
+def test_market_flag_prints_the_check(tmp_path, monkeypatch, capsys):
+    (tmp_path / "views.csv").write_text(EXAMPLE)
+    assert run(tmp_path, monkeypatch, "NVDA", "KO", "VOO", "--market", "--no-save") == 0
+    out = capsys.readouterr().out
+    assert "Market check" in out and "option data unavailable" in out   # fake Yahoo: no chains

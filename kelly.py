@@ -284,6 +284,208 @@ def download_latest_prices(tickers: list[str]) -> dict[str, float]:
         return {}
 
 
+# ---------------------------------------------------------- market odds ---
+# The tote board. Munger: winning bettors "look and sift the world for a
+# mispriced bet" (pp. 209-210). Option prices are the market's odds; your edge
+# is where your odds differ from them. These numbers are shown BESIDE your
+# odds, after you've entered them, and never feed the sizing: copying them in
+# would make your edge zero by construction.
+#
+# Caveats, stated wherever they're shown: option-implied odds are risk-neutral
+# (they carry a risk premium, so downside reads a little high and upside a
+# little low), they price a share price on a date rather than a permanent
+# loss, and listed options rarely run past ~2 years.
+OPTION_MAX_SPREAD = 0.5     # skip quotes whose bid/ask spread is over 50% of the mid
+OPTION_MIN_YEARS = 0.1      # ignore expiries closer than ~5 weeks
+
+
+def _bs_price(S: float, K: float, T: float, r: float, vol: float, call: bool) -> float:
+    """Black-Scholes price (European, no dividends); r is continuous."""
+    from scipy.stats import norm
+    sd = vol * np.sqrt(T)
+    d1 = (np.log(S / K) + (r + vol ** 2 / 2) * T) / sd
+    d2 = d1 - sd
+    if call:
+        return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+    return K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+
+
+def _implied_vol(price: float, S: float, K: float, T: float, r: float,
+                 call: bool) -> float | None:
+    """The volatility that reproduces a quoted price, or None if no volatility
+    between 1% and 500% does (a stale or nonsensical quote)."""
+    from scipy.optimize import brentq
+    f = lambda v: _bs_price(S, K, T, r, v, call) - price   # noqa: E731
+    lo, hi = 0.01, 5.0
+    try:
+        if f(lo) > 0 or f(hi) < 0:
+            return None
+        return float(brentq(f, lo, hi, xtol=1e-6))
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def option_smile(calls: pd.DataFrame, puts: pd.DataFrame, S: float, T: float,
+                 r: float) -> pd.DataFrame:
+    """
+    Implied volatility by strike, from out-of-the-money quotes (puts below
+    today's price, calls at or above: the liquid side of each strike). Each
+    volatility is solved from the bid/ask MID, not Yahoo's own figure, which
+    can be computed from a stale last trade. Quotes with no bid, a crossed
+    market, or a spread over OPTION_MAX_SPREAD of the mid are skipped.
+    """
+    rows = []
+    for side, call in ((puts, False), (calls, True)):
+        if side is None or not len(side):
+            continue
+        q = side[["strike", "bid", "ask"]].apply(pd.to_numeric, errors="coerce").dropna()
+        q = q[(q.strike < S) if not call else (q.strike >= S)]
+        q = q[(q.bid > 0) & (q.ask >= q.bid)]
+        mid = (q.bid + q.ask) / 2
+        q = q[(q.ask - q.bid) <= OPTION_MAX_SPREAD * mid]
+        for K, m in zip(q.strike, (q.bid + q.ask) / 2):
+            iv = _implied_vol(float(m), S, float(K), T, r, call)
+            if iv is not None:
+                rows.append((float(K), iv))
+    return pd.DataFrame(rows, columns=["strike", "iv"]).sort_values("strike").reset_index(drop=True)
+
+
+def _iv_at(smile: pd.DataFrame, K: float) -> float | None:
+    """Volatility at strike K, on a straight line between the nearest traded
+    strikes. None outside the traded range: no extrapolating into thin air."""
+    if smile.empty or not (smile.strike.min() <= K <= smile.strike.max()):
+        return None
+    return float(np.interp(K, smile.strike, smile.iv))
+
+
+def implied_odds(smile: pd.DataFrame, S: float, T: float, r: float,
+                 bear_price: float, bull_price: float) -> tuple[float, float, str]:
+    """
+    Market-implied (risk-neutral) chance of finishing below bear_price and
+    above bull_price at the expiry: N(-d2) and N(d2), each with the volatility
+    at its own strike (the skew matters most for the bear case: far-down puts
+    carry more volatility than at-the-money ones). NaN when there's no
+    reliable quote near that price; the note says which.
+    """
+    from scipy.stats import norm
+
+    def d2(K, vol):
+        return (np.log(S / K) + (r - vol ** 2 / 2) * T) / (vol * np.sqrt(T))
+    notes = []
+    p = {}
+    for label, K, below in (("bear", bear_price, True), ("bull", bull_price, False)):
+        vol = _iv_at(smile, K) if K and K > 0 else None
+        if vol is None:
+            p[label] = np.nan
+            notes.append(f"no reliable quotes near the {label} price ${K:,.2f}")
+        else:
+            p[label] = float(norm.cdf(-d2(K, vol)) if below else norm.cdf(d2(K, vol)))
+    return p["bear"], p["bull"], "; ".join(notes)
+
+
+def _pick_expiry(expiries: list[str], horizon: float, today: date) -> tuple[str, float] | None:
+    """The longest expiry at or under the horizon (the longest of all if every
+    one is shorter), skipping any closer than OPTION_MIN_YEARS."""
+    dated = []
+    for e in expiries:
+        try:
+            years = (datetime.strptime(e, "%Y-%m-%d").date() - today).days / 365.25
+        except ValueError:
+            continue
+        if years >= OPTION_MIN_YEARS:
+            dated.append((years, e))
+    if not dated:
+        return None
+    fits = [d for d in dated if d[0] <= horizon + 1 / 52]
+    years, e = max(fits) if fits else min(dated)
+    return e, years
+
+
+def fetch_option_smile(ticker: str, spot: float, horizon: float, rf: float,
+                       today: date | None = None) -> dict:
+    """
+    One option chain from Yahoo: the expiry closest to (at or under) the
+    horizon, and its smile. Returns {expiry, years, smile, note}; never raises,
+    since market odds are a reference and must not block sizing.
+    """
+    import yfinance as yf
+
+    out = {"expiry": None, "years": np.nan, "smile": pd.DataFrame(columns=["strike", "iv"]),
+           "note": ""}
+    try:
+        tk = yf.Ticker(ticker)
+        pick = _pick_expiry(list(tk.options or []), horizon, today or date.today())
+        if pick is None:
+            out["note"] = "no listed options"
+            return out
+        out["expiry"], out["years"] = pick
+        chain = tk.option_chain(out["expiry"])
+        out["smile"] = option_smile(chain.calls, chain.puts, spot, out["years"],
+                                    np.log1p(rf))
+        if out["smile"].empty:
+            out["note"] = "no reliable quotes"
+    except Exception as e:
+        out["note"] = f"option data unavailable ({type(e).__name__})"
+    return out
+
+
+def market_check(views: pd.DataFrame, prices_now: dict[str, float], horizon: float,
+                 rf: float, smiles: dict[str, dict] | None = None) -> pd.DataFrame:
+    """
+    Your odds beside the market's, one row per view with a usable price. Bear
+    and bull PRICES come from your view (re-anchored to today if it carries an
+    as_of_price; the bull from your value where you gave one). smiles can be
+    passed in (the app caches them); otherwise they're fetched.
+    """
+    cols = ["ticker", "your_bear", "market_bear", "bear_price", "your_bull", "market_bull",
+            "bull_price", "expiry", "years", "note"]
+    if views is None or not len(views):
+        return pd.DataFrame(columns=cols)
+    with captured_log():
+        v = resolve_views(views, prices_now)
+    rows = []
+    r = np.log1p(rf)
+    for t, x in v.iterrows():
+        S = x["price"]
+        bear_px, bull_px = S * (1 - x["bear"]), S * (1 + x["bull"])
+        sm = (smiles or {}).get(t) or fetch_option_smile(t, S, horizon, rf)
+        if sm["smile"].empty:
+            pb, pu, note = np.nan, np.nan, sm["note"]
+        else:
+            pb, pu, note = implied_odds(sm["smile"], S, sm["years"], r, bear_px, bull_px)
+            if sm["years"] < horizon - 0.25:
+                note = "; ".join(filter(None, [f"longest options run {sm['years']:.1f}y, "
+                                               f"shorter than your {horizon:g}y horizon", note]))
+        rows.append({"ticker": t, "your_bear": x["p_bear"], "market_bear": pb,
+                     "bear_price": bear_px, "your_bull": x["p_bull"], "market_bull": pu,
+                     "bull_price": bull_px, "expiry": sm["expiry"], "years": sm["years"],
+                     "note": note})
+    return pd.DataFrame(rows, columns=cols)
+
+
+MARKET_GAP = 0.10   # a gap of 10+ points between your odds and the market's gets a sentence
+
+
+def market_gaps(check: pd.DataFrame) -> list[str]:
+    """Plain-words gaps worth explaining to yourself (the mispriced-bet question)."""
+    out = []
+    for _, r in check.iterrows():
+        if pd.notna(r.market_bear) and abs(r.your_bear - r.market_bear) >= MARKET_GAP:
+            if r.your_bear < r.market_bear:
+                ask = "You see less downside than the market. What do you know that it doesn't?"
+            else:
+                ask = ("You see more downside than the market. Is the bear case too heavy, "
+                       "or is the stock cheap for a reason?")
+            out.append(f"{r.ticker}: you give the bear case {r.your_bear:.0%}; the market "
+                       f"prices {r.market_bear:.0%} below ${r.bear_price:,.2f}. {ask}")
+        if pd.notna(r.market_bull) and abs(r.your_bull - r.market_bull) >= MARKET_GAP:
+            more = r.your_bull > r.market_bull
+            out.append(f"{r.ticker}: you give the bull case {r.your_bull:.0%}; the market "
+                       f"prices {r.market_bull:.0%} above ${r.bull_price:,.2f}. You're "
+                       f"{'more' if more else 'less'} optimistic than the market.")
+    return out
+
+
 # ---------------------------------------------------------------- views ---
 # A view is up to three outcomes for a thesis over the horizon:
 #   bear : PERMANENT loss of capital (the book's definition of risk), prob p_bear
@@ -1375,6 +1577,9 @@ def main(argv: list[str] | None = None) -> int:
                    help=f"Correlation shrinkage toward independence (default {COV_SHRINK:g})")
     s.add_argument("--market-return", type=float, default=MARKET_RETURN,
                    help=f"Long-run market return for CAPM names (default {MARKET_RETURN})")
+    s.add_argument("--market", action="store_true",
+                   help="After sizing, show the option-implied odds beside your own odds "
+                        "for each view (a reference; never used in the sizing)")
     s.add_argument("--neutral", action="store_true",
                    help="Test mode: scale each view to its CAPM return, keeping its shape "
                         "(no edge). Sizes should land near the no-views baseline")
@@ -1496,6 +1701,19 @@ def main(argv: list[str] | None = None) -> int:
             columns={"scenario": "Your basket if the truth is", "prob_loss": "Chance of loss",
                      "worst_5pct": "Worst 1-in-20", "expected_growth_rate": "Exp. growth/yr"})
         print(_fmt_table(h, pct=list(h.columns[1:])))
+    if args.market and len(in_basket):
+        check = market_check(in_basket, prices_now, args.horizon, rf)
+        print("\nMarket check: your odds vs. option-implied odds (risk-neutral; a reference, "
+              "never used in the sizing)")
+        m = check.rename(columns={"ticker": "Ticker", "your_bear": "Your bear",
+                                  "market_bear": "Market", "bear_price": "Bear $",
+                                  "your_bull": "Your bull", "market_bull": "Market ",
+                                  "bull_price": "Bull $", "expiry": "Expiry", "note": "Note"})
+        print(_fmt_table(m.drop(columns=["years"]),
+                         pct=["Your bear", "Market", "Your bull", "Market "],
+                         money=["Bear $", "Bull $"]))
+        for gap in market_gaps(check):
+            print("  " + gap)
     print("\nAll fractions:\n" + _fmt_table(fstats.reset_index(),
                                             pct=[c for c in fstats.columns]))
     print(run_note(summary, rf, rf_source, logs))
