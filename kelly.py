@@ -64,6 +64,11 @@ DEFAULT_HORIZON = 3.0         # years for a thesis to play out (also CAPM names)
 N_SCENARIOS = 20_000          # joint outcomes simulated for expected-log Kelly
 VIEW_MIN_MONTHS = 12          # min shared months to estimate a correlation
 SCENARIO_SEED = 7             # fixed so reruns give identical weights
+# Joint outcomes are tied together with a Student-t copula: the same pairwise
+# correlations as a Gaussian one, but bad outcomes land together more often,
+# as they do in a crash. Lower = more crash clustering; None = Gaussian.
+# Fitted t-copulas on stock returns typically land around 4-8.
+COPULA_DOF = 5
 
 UA = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -599,10 +604,16 @@ def _basket_filter(results: pd.DataFrame, basket: list[str]) -> tuple[pd.DataFra
 
 def _correlation(prices: pd.DataFrame, basket: list[str], shrink: float) -> tuple[np.ndarray, int]:
     """Pairwise correlations of monthly returns (each pair uses the months it
-    shares, min VIEW_MIN_MONTHS; otherwise 0), shrunk toward independence and
-    repaired to be positive semi-definite."""
+    shares, min VIEW_MIN_MONTHS), shrunk toward independence and repaired to be
+    positive semi-definite. A pair without enough shared months (a recent
+    listing) gets the basket's average correlation, not zero: treating a new
+    name as independent would understate how concentrated the basket is."""
     rets = prices[basket].pct_change(fill_method=None)
-    corr = rets.corr(min_periods=VIEW_MIN_MONTHS).fillna(0.0).to_numpy(copy=True)
+    corr = rets.corr(min_periods=VIEW_MIN_MONTHS).to_numpy(copy=True)
+    off = ~np.eye(len(basket), dtype=bool)
+    known = corr[off & ~np.isnan(corr)]
+    fill = max(float(known.mean()), 0.0) if known.size else 0.0
+    corr = np.where(np.isnan(corr), fill, corr)
     np.fill_diagonal(corr, 1.0)
     corr = (1 - shrink) * corr + shrink * np.eye(len(basket))
     vals, vecs = np.linalg.eigh(corr)
@@ -612,7 +623,7 @@ def _correlation(prices: pd.DataFrame, basket: list[str], shrink: float) -> tupl
     for t in basket:
         if rets[t].notna().sum() < VIEW_MIN_MONTHS:
             log(f"Portfolio: {t} has <{VIEW_MIN_MONTHS} months of prices; "
-                f"treated as uncorrelated with the rest")
+                f"assumed to move with the basket average (correlation {fill:.2f})")
     return corr, int(rets.dropna(how="all").shape[0])
 
 
@@ -620,18 +631,27 @@ def simulate_outcomes(ok: pd.DataFrame, basket: list[str], corr: np.ndarray,
                       horizon: float, n_scenarios: int = N_SCENARIOS,
                       seed: int = SCENARIO_SEED) -> np.ndarray:
     """
-    Joint horizon returns, shape (n_scenarios, n_names), via a Gaussian copula
-    on historical correlations:
+    Joint horizon returns, shape (n_scenarios, n_names), via a Student-t
+    copula (COPULA_DOF) on historical correlations. Each name keeps its own
+    outcomes; the copula only sets how they line up, with joint extremes
+    (crashes) more common than a Gaussian copula allows:
       - name with a view : bear / base / bull with your probabilities, ordered
                            so correlated names tend to land on the same side
       - name without one : lognormal with CAPM mean and historical volatility
     """
-    from scipy.stats import norm
+    from scipy.stats import norm, t as student_t
 
     rng = np.random.default_rng(seed)
     L = np.linalg.cholesky(corr)
     z = rng.standard_normal((n_scenarios, len(basket))) @ L.T
-    u = norm.cdf(z)
+    if COPULA_DOF:
+        # One shared shock scale per scenario: when it's large, every name is
+        # pushed toward its tails at once.
+        s = np.sqrt(rng.chisquare(COPULA_DOF, size=(n_scenarios, 1)) / COPULA_DOF)
+        u = student_t.cdf(z / s, COPULA_DOF)
+        z = norm.ppf(np.clip(u, 1e-12, 1 - 1e-12))    # normal scores for lognormal names
+    else:
+        u = norm.cdf(z)
     out = np.empty_like(z)
     for j, t in enumerate(basket):
         row = ok.loc[t]

@@ -114,3 +114,60 @@ def test_solver_converges_at_every_fraction():
         _, _, s = ks.size_basket(prices, basket, 0.051, views=views)
         assert s.solver_ok.all(), s[["kelly_fraction", "solver_ok"]]
         assert (s.worst_5pct > -1).all()
+
+
+def _two_bears(rho):
+    """Two names with the same 20% bear odds, correlated rho."""
+    ok = pd.DataFrame({"edge_source": "views", "p_bear": .2, "bear": .5, "p_base": 0.0,
+                       "base": np.nan, "p_bull": .8, "bull": .5}, index=["A", "B"])
+    return ok, np.array([[1, rho], [rho, 1.0]])
+
+
+def test_t_copula_makes_bears_cluster_but_keeps_your_odds(monkeypatch):
+    ok, corr = _two_bears(0.5)
+    both = {}
+    for dof in (None, ks.COPULA_DOF):
+        monkeypatch.setattr(ks, "COPULA_DOF", dof)
+        R = ks.simulate_outcomes(ok, ["A", "B"], corr, 3.0, 100_000)
+        bear = R < 0
+        assert np.allclose(bear.mean(axis=0), 0.2, atol=0.01)   # your odds, either way
+        both[dof] = (bear[:, 0] & bear[:, 1]).mean()
+    assert both[ks.COPULA_DOF] > both[None] * 1.05               # crashes come together more
+
+
+def test_copula_dof_is_the_engine_default():
+    assert ks.COPULA_DOF is not None and 3 <= ks.COPULA_DOF <= 8
+
+
+def test_new_listing_moves_with_the_basket_average(prices):
+    basket = ["AAA", "BBB", "CCC", "NEWCO"]
+    short = prices.copy()
+    short.loc[short.index[:-8], "NEWCO"] = np.nan    # 8 months: below VIEW_MIN_MONTHS
+    corr, _ = ks._correlation(short, basket, shrink=0.0)
+    others = corr[:3, :3][~np.eye(3, dtype=bool)].mean()
+    assert others > 0.1
+    assert np.allclose(corr[3, :3], others, atol=0.02)          # not zero
+
+
+def _growth(prices, views, seed=ks.SCENARIO_SEED, n=ks.N_SCENARIOS):
+    import functools
+    sim = ks.simulate_outcomes
+    try:
+        ks.simulate_outcomes = functools.partial(sim, seed=seed)
+        _, _, s = ks.size_basket(prices, ["NVDA", "ASML", "KO", "MSFT", "VOO"], .045,
+                                 views=views, prices_now={"ASML": 900.0}, n_scenarios=n)
+    finally:
+        ks.simulate_outcomes = sim
+    return s.set_index("kelly_fraction").at["eighth", "expected_growth_rate"]
+
+
+def test_sizing_is_stable_across_random_draws():
+    """Monte Carlo noise: the basket's expected growth barely moves with the
+    seed or with 4x the scenarios. (Weights between near-substitutes, like a
+    stock and the index, can trade places; the portfolio they make can't.)"""
+    from conftest import fake_download
+    prices = fake_download(["NVDA", "ASML", "KO", "MSFT", "VOO", "^GSPC"])["Close"]
+    views = ks.load_views(ks.Path(__file__).resolve().parents[1] / "views.example.csv")
+    g = [_growth(prices, views, seed=s) for s in (1, 2, 3)]
+    assert max(g) - min(g) < 0.005
+    assert abs(_growth(prices, views, n=4 * ks.N_SCENARIOS) - g[0]) < 0.005
