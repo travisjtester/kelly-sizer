@@ -51,6 +51,11 @@ def test_views_drive_sizing_and_match_the_cli_helpers(app):
     assert {"ticker", "weight", "dollars", "edge", "margin_of_safety", "solo_kelly",
             "swing"} <= set(alloc.columns)
     assert set(alloc.edge.dropna()) - {""} == {"views", "CAPM"}
+    # Fractions, not percents, so the table's CSV download matches the other exports
+    names = alloc[alloc.ticker != "CASH"]
+    assert alloc.weight.between(0, 1).all() and alloc.weight.sum() == pytest.approx(1)
+    assert pd.api.types.is_numeric_dtype(alloc.solo_kelly)
+    assert names.swing.dropna().lt(5).all()
     wrong = next(d.value for d in at.dataframe if "Verdict" in d.value.columns)
     assert set(wrong.Verdict) <= {"Robust", "Sensitive", "Fragile", "Not held", ""}
     assert any(h.value.startswith(":red[What if") for h in at.subheader)

@@ -69,6 +69,26 @@ def sp500_list() -> pd.DataFrame:
         return pd.DataFrame(columns=["ticker", "name", "sector"])
 
 
+@st.cache_data(ttl=7 * 24 * 3600, show_spinner=False)
+def extra_meta_for(ticker: str) -> dict:
+    """Name/sector for a ticker outside the S&P 500 list (ASML, TSM, SNOW...).
+    Cached per ticker so changing the basket doesn't refetch the rest."""
+    try:
+        return ks.lookup_extra_meta([ticker]).iloc[0].to_dict()
+    except Exception:
+        return {"ticker": ticker, "name": None, "sector": None}
+
+
+def meta_for(tickers: list[str]) -> pd.DataFrame:
+    """S&P 500 names/sectors, plus a Yahoo lookup for anything not on that list."""
+    base = meta[["ticker", "name", "sector"]]
+    missing = [t for t in tickers if t not in set(base["ticker"])]
+    if not missing:
+        return base
+    extra = pd.DataFrame([extra_meta_for(t) for t in missing])
+    return pd.concat([base, extra], ignore_index=True)
+
+
 @st.cache_data(ttl=12 * 3600, show_spinner=False)
 def prices_for(tickers: tuple[str, ...]) -> pd.DataFrame:
     return ks.download_monthly_closes(list(tickers) + [ks.BENCHMARK], ks.VARIANCE_YEARS)
@@ -255,7 +275,7 @@ else:
                 with ks.captured_log() as logs:
                     results, weights, summary = ks.size_basket(
                         prices, tickers, rf, views=views, prices_now=prices_now,
-                        meta=meta, market_return=mkt_ret, horizon=horizon,
+                        meta=meta_for(tickers), market_return=mkt_ret, horizon=horizon,
                         max_weight=max_weight, max_leverage=max_lev, shrink=shrink)
                 results_ready = True
             except ValueError as e:
@@ -273,28 +293,27 @@ if results_ready:
             col.metric(label, value, help=why or None)
 
     # ---- allocation table (shared with the CLI)
+    # Keep the data as fractions (0.119 = 11.9%) so the table's built-in CSV
+    # download matches every other export; the column formats do the display.
     tbl = ks.allocation_table(weights, frac, amount)
-    for c in ["weight", "margin_of_safety", "solo_kelly", "swing"]:
-        if c in tbl.columns:
-            tbl[c] = tbl[c] * 100
     st.subheader(f"{fraction_label} Kelly allocation")
     tbl["edge"] = tbl["edge"].fillna("")
-    for c in ["margin_of_safety", "solo_kelly", "swing"]:      # blanks, not "None"
-        if c in tbl.columns:
-            tbl[c] = tbl[c].map(lambda v: "" if pd.isna(v) else f"{v:.0f}%")
     st.dataframe(
         tbl, hide_index=True, width="stretch",
         column_config={
             "ticker": st.column_config.TextColumn("Ticker", pinned=True),
-            "weight": st.column_config.ProgressColumn("Weight", format="%.1f%%",
-                                                      min_value=0, max_value=100),
+            "weight": st.column_config.ProgressColumn("Weight", format="percent",
+                                                      min_value=0, max_value=1),
             "dollars": st.column_config.NumberColumn("$", format="$%,.0f"),
             "edge": st.column_config.TextColumn("Edge"),
-            "margin_of_safety": st.column_config.Column("MoS", help="Margin of safety"),
-            "solo_kelly": st.column_config.Column(
-                "Solo Kelly", help="This name's Kelly bet on its own: a ceiling, not a target"),
-            "swing": st.column_config.Column(
-                "Swing", help="Annual price volatility: how bumpy, not how risky"),
+            "margin_of_safety": st.column_config.NumberColumn(
+                "MoS", format="percent", help="Margin of safety"),
+            "solo_kelly": st.column_config.NumberColumn(
+                "Solo Kelly", format="percent",
+                help="This name's Kelly bet on its own: a ceiling, not a target"),
+            "swing": st.column_config.NumberColumn(
+                "Swing", format="percent",
+                help="Annual price volatility: how bumpy, not how risky"),
         },
     )
 
