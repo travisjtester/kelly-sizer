@@ -111,3 +111,19 @@ def test_untouched_view_keeps_its_price_and_horizon(app):
                  "value": None, "as_of_price": 123.0, "horizon": 1.0}}
     at.run()
     assert at.session_state["views"]["NVDA"]["as_of_price"] == 123.0
+
+
+def test_market_odds_stay_hidden_until_you_have_odds(app):
+    at = size(app)
+    assert not any(t.label.startswith("Show the market") for t in at.toggle)
+    assert any("stay hidden until you've committed" in c.value for c in at.caption)
+
+
+def test_market_check_shows_beside_your_views(app):
+    app.session_state["views"] = {
+        "NVDA": {"p_bear": .25, "bear": .5, "p_base": .35, "base": .15, "bull": 1.0, "value": None}}
+    at = size(app)
+    next(t for t in at.toggle if t.label.startswith("Show the market")).set_value(True).run()
+    assert not at.exception
+    check = next(d.value for d in at.dataframe if "market_bear" in d.value.columns)
+    assert list(check.ticker) == ["NVDA"] and check.your_bear.iloc[0] == pytest.approx(.25)

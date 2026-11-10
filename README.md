@@ -49,6 +49,7 @@ python kelly.py --screen --extra TSM ASML              # opt-in: S&P 500 no-edge
 | Correlation shrinkage | Settings | `--shrink` | 0.20 |
 | Long-run market return (CAPM) | Settings | `--market-return` | 10.68% |
 | Neutral inputs (test mode) | Settings | `--neutral` | off |
+| Market check | Market check (after your odds) | `--market` | off |
 
 **Neutral inputs** scales each view so its expected return equals its CAPM return while keeping its shape (the spread between bear, base and bull). With the edge removed, sizes should land near the no-views baseline; whatever gap remains is the scenario shape alone. Use it to test a set of inputs, such as analyst targets, not to size.
 
@@ -71,6 +72,15 @@ KO,0.10,0.15,,,0.30,,"Two outcomes only: base left blank"
 | `horizon` | Optional: years the view assumes (`1` for 12-month targets). If it differs from the run's horizon you get a warning; returns aren't rescaled |
 
 Bull odds = `1 − p_bear − p_base`. **Units:** use one style per file. The odds columns decide it: odds written as percents (`40`) mean the whole file is percents; decimals (`0.4`) mean decimals. A `%` sign always means percent. Older `p_win, upside, downside` files still load. Start from `views.example.csv`.
+
+
+### Market check: your odds vs. the market's
+Munger's winning bettors "look and sift the world for a mispriced bet" (pp. 209–210). Option prices are the market's odds; your edge is where your odds differ. **Market check** shows, for each name you have a view on, the option-implied chance of finishing below your bear price and above your bull price, beside your own odds, with a sentence wherever the gap is 10 points or more.
+
+- **Hidden until you commit.** The app shows market odds only for views you've already entered, behind a toggle, so they can't anchor your estimate.
+- **Never used in the sizing.** Copying the market's odds into your views would make your edge zero by construction (that's what neutral mode does on purpose).
+- **How it's worked out:** the longest expiry at or under your horizon; volatility solved from each out-of-the-money option's bid/ask mid (not Yahoo's own figure), skipping quotes with no bid or a spread over 50% of the mid; a straight line between the two nearest strikes at your price; then N(−d2) below the bear price and N(d2) above the bull price. Prices outside the traded strikes say "no reliable quotes" instead of guessing.
+- **Read it as a reference.** The odds are risk-neutral (a risk premium makes downside read a little high and upside a little low), they price a share price on a date rather than a broken thesis, and listed options rarely run past about 2 years. European pricing without dividends, so high-yield names read slightly off.
 
 ## How it sizes
 1. Each name gets a distribution of horizon returns: your scenarios where you have a view; otherwise **CAPM** (horizon-matched Treasury + beta × market premium, lognormal with historical volatility).
@@ -114,6 +124,7 @@ Solo Kelly for every S&P 500 name under CAPM (plus `--extra` names and your view
 | Buffett: "25 percent for the largest," up to 40% (p. 96) | Default 25%; app ceiling 40%; CLI warns above it |
 | Concentrate in 5–20 names (p. 3) | Up to 15 in the app |
 | Buy and hold; Shannon didn't trim (p. 82) | Buy-and-hold horizon |
+| Bet only on a mispriced bet: "look and sift the world for a mispriced bet" (Munger, pp. 209–210) | Market check: your odds beside option-implied odds, revealed after you enter yours; never used in sizing |
 | Kelly needs accurate probabilities; misjudged downside overstates the bet (p. 105) | "What if I'm wrong?" stress test on every result, plus the conviction journal's calibration over time |
 | "Know-nothing" investors should index (p. 3) | No view → sized as market exposure under CAPM; `--screen` labeled as the no-edge baseline |
 
