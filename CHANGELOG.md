@@ -3,6 +3,7 @@
 What changed, newest first, by pull request. Everything merged to `main` deploys to the [live app](https://kelly-sizer.streamlit.app).
 
 ## 2026-11-11
+- **Saved data** (#24): with storage set up in Streamlit secrets, the app loads your journal and views from a private GitHub repo once you enter your passphrase, and saves every change as you go (one commit each). Journal entries from two devices merge. The CLI uses the same files from a clone of that repo. Without secrets nothing changes. Also corrects the in-app method note, which still said CAPM used the 10-year Treasury.
 - **Book and docs** (#19): two page citations corrected against the book's text (probability and risk vs. reward is p. 1; Shannon's no-trimming is pp. 81–82). The README's book table is split into what comes from the book and the tool's extensions. **Book mode** (`--book-mode`, app Settings): cash earns 0%, so a single bet's Kelly is exactly the book's f* = (bp − q)/b. Five-minute walkthrough, this changelog, and `views.example.csv` with the `as_of_price` and `horizon` columns.
 
 ## 2026-11-10

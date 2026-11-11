@@ -9,12 +9,15 @@ Deploy:        Streamlit Community Cloud -> point at this repo, main file app.py
 from __future__ import annotations
 
 import importlib
+import io
 import os
-from datetime import date
+import time
+from datetime import date, datetime
 
 import pandas as pd
 import streamlit as st
 
+import github_store as gs
 import kelly as ks
 
 st.set_page_config(page_title="Kelly Sizer", page_icon="📐", layout="centered")
@@ -148,10 +151,118 @@ if "ticker_options" not in st.session_state:
     # picker as a new widget and resets the basket to the defaults.
     st.session_state.ticker_options = sorted(set(options) | set(st.session_state.views))
 
+# ------------------------------------------------------------ saved data ---
+# Your journal and views live in a private GitHub repo (github_store.py), set
+# up in Streamlit secrets. The app's URL is public, so nothing is read or
+# written until the passphrase is entered. Without secrets, the app works as
+# before: this session only, plus Save/Load CSV.
+STORE, PASSPHRASE = gs.from_secrets(st.secrets)
+MAX_ATTEMPTS = 5
+
+
+def _views_csv(views: dict) -> str:
+    return (pd.DataFrame.from_dict(views, orient="index").rename_axis("ticker")
+            .reset_index().to_csv(index=False)) if views else ""
+
+
+def _views_from_csv(text: str | None) -> dict:
+    if not text or not text.strip():
+        return {}
+    v = ks.normalize_views(pd.read_csv(io.StringIO(text)))
+    return {t: {k: r[k] for k in STORE_FIELDS} for t, r in v.iterrows()}
+
+
+def _journal_from_csv(text: str | None) -> pd.DataFrame:
+    if not text or not text.strip():
+        return ks.normalize_journal(None)
+    return ks.normalize_journal(pd.read_csv(io.StringIO(text)))
+
+
+def _unlock() -> None:
+    """Load the saved files and merge in anything already entered this session
+    (this session wins for a view; journal entries are combined)."""
+    v_text, v_sha = STORE.read(gs.VIEWS_PATH)
+    j_text, j_sha = STORE.read(gs.JOURNAL_PATH)
+    views = {**_views_from_csv(v_text), **st.session_state.views}
+    journal = ks.append_journal(_journal_from_csv(j_text), st.session_state.journal)
+    st.session_state.views, st.session_state.journal = views, journal
+    # What's in the repo now, as this app writes it: a save happens only on a change.
+    st.session_state._saved = {gs.VIEWS_PATH: _views_csv(_views_from_csv(v_text)),
+                               gs.JOURNAL_PATH: _journal_from_csv(j_text).to_csv(index=False)}
+    st.session_state._sha = {gs.VIEWS_PATH: v_sha, gs.JOURNAL_PATH: j_sha}
+    st.session_state.unlocked = True
+    if views:
+        st.session_state._add_picks = list(views)
+
+
+def _save(path: str, text: str, what: str) -> str:
+    """Write one file; on a conflict (another device saved first), merge the
+    journal or let this session's views win, then write again."""
+    try:
+        return STORE.write(path, text, f"Kelly Sizer: update {what}",
+                           st.session_state._sha.get(path))
+    except gs.Conflict:
+        remote, sha = STORE.read(path)
+        if path == gs.JOURNAL_PATH:
+            merged = ks.append_journal(_journal_from_csv(remote), st.session_state.journal)
+            st.session_state.journal = merged
+            text = merged.to_csv(index=False)
+        st.session_state._sha[path] = sha
+        st.session_state._saved[path] = text
+        return STORE.write(path, text, f"Kelly Sizer: update {what} (merged)", sha)
+
+
+def _autosave() -> None:
+    """Save whatever changed since the last save. Runs at the end of every run."""
+    files = {gs.VIEWS_PATH: (_views_csv(st.session_state.views), "views"),
+             gs.JOURNAL_PATH: (st.session_state.journal.to_csv(index=False), "journal")}
+    for path, (text, what) in files.items():
+        if text == st.session_state._saved.get(path):
+            continue
+        try:
+            st.session_state._sha[path] = _save(path, text, what)
+            st.session_state._saved[path] = text
+            st.session_state._save_status = f"saved {datetime.now():%H:%M}"
+        except gs.StoreError as e:
+            st.session_state._save_status = f"not saved: {e}"
+            st.toast(f"Couldn't save your {what}: {e}", icon="⚠️")
+            return
+
+
 # --------------------------------------------------------------------- UI ---
 st.title("📐 Kelly Sizer")
 st.caption("Kelly position sizing after *Concentrated Investing*: bet big when you hold "
            "an edge, never risk ruin, and size the whole basket at once.")
+
+if STORE and not st.session_state.get("unlocked"):
+    with st.expander("🔒 Unlock your saved journal and views", expanded=True):
+        tries = st.session_state.get("_tries", 0)
+        if tries >= MAX_ATTEMPTS:
+            st.error("Too many wrong passphrases. Reload the page to try again.")
+        else:
+            with st.form("unlock", border=False):
+                pw = st.text_input("Passphrase", type="password",
+                                   help="Set in the app's secrets. Unlocks loading and "
+                                        "saving to your private repo.")
+                go = st.form_submit_button("Unlock", width="stretch")
+            if go:
+                if gs.check_passphrase(pw, PASSPHRASE):
+                    try:
+                        _unlock()
+                        st.rerun()
+                    except gs.StoreError as e:
+                        st.error(f"Unlocked, but couldn't load your files: {e}")
+                else:
+                    st.session_state._tries = tries + 1
+                    time.sleep(1.5)                     # slow down guessing
+                    st.error("Wrong passphrase.")
+        st.caption("Until you unlock, this session works on its own: nothing is loaded "
+                   "or saved.")
+elif STORE:
+    status = st.session_state.get("_save_status", "up to date")
+    (st.warning if status.startswith("not saved") else st.caption)(
+        f"🔓 Your journal and views save to your private repo "
+        f"({STORE.repo}) as you go · {status}")
 
 MAX_PICKS = 15
 
@@ -264,8 +375,7 @@ with st.expander("Your research (views)", expanded=bool(store)):
     for note in st.session_state.pop("_upload_notes", []):
         st.warning(note)
     if store:
-        csv = (pd.DataFrame.from_dict(store, orient="index").rename_axis("ticker")
-               .reset_index().to_csv(index=False))
+        csv = _views_csv(store)
         down.download_button("Save views CSV", csv, "views.csv", "text/csv",
                              width="stretch")
 
@@ -565,7 +675,7 @@ insight" bought with a margin of safety. Each view is up to three outcomes over 
 holding horizon: a **bear** case of *permanent* loss (the book's definition of risk,
 not volatility), an optional **base** case, and a **bull** case, entered directly or as
 your intrinsic **value** per share against today's price. Names without a view use
-CAPM, the 10-year Treasury plus beta × the market premium ({mkt_ret:.1%} long-run
+CAPM, the Treasury yield matched to your horizon plus beta × the market premium ({mkt_ret:.1%} long-run
 return minus the risk-free rate). CAPM assumes no edge, so it sizes by risk alone.
 
 **Sizing bets together.** Thorp's warning: Kelly computed for each bet alone
@@ -587,3 +697,7 @@ Kelly sizes on the edge you give it, so overconfident odds or an understated bea
 produce oversized bets. Not financial advice.
 """
 )
+
+# ---- save anything that changed this run (only once unlocked)
+if STORE and st.session_state.get("unlocked"):
+    _autosave()

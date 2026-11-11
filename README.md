@@ -32,8 +32,26 @@ Deployed free on Streamlit Community Cloud (share.streamlit.io → this repo →
 
 - Research table: Bear odds / Bear loss / Base odds / Base / Bull or Value $; bull odds, price and margin of safety fill in.
 - Brand palette in `.streamlit/config.toml` (light and dark): teal `#379A8B` for primary and success, coffee `#D1B07C` for caution, red `#DB444B` for "What if I'm wrong?" and fragile bets, grey `#D3D3D3` for borders. Text shades meet 4.5:1 contrast in both modes.
-- **Save / Load** views and journal CSVs (iPhone saves to Files). Cloud sessions don't keep files, so save before you leave. The same files work on the command line.
+- **Saved data**: with storage set up (below), your journal and views load when you unlock and save themselves as you go. Without it, **Save / Load** the CSVs (iPhone saves to Files) before you leave, since cloud sessions don't keep files. Either way the same files work on the command line.
 - To preload, commit `views.csv` / `journal.csv` to the repo root (`git add -f`; `*.csv` is gitignored), but only if you're fine with them being as public as the repo.
+
+### Saving your data (private GitHub repo)
+The app's URL is public, so your data sits in a **private** repo and the app only touches it after you enter a passphrase. One-time setup, about five minutes:
+
+1. **Create a private repo** on GitHub, e.g. `kelly-sizer-data` (empty is fine).
+2. **Create a fine-grained token**: GitHub → Settings → Developer settings → Fine-grained tokens → Generate. Repository access: **only** `kelly-sizer-data`. Permissions → Repository → **Contents: Read and write**. Note the expiry date; you'll renew it.
+3. **Add secrets**: on Streamlit Cloud, your app → Settings → Secrets. Paste (template in `.streamlit/secrets.toml.example`):
+   ```toml
+   [storage]
+   repo = "travisjtester/kelly-sizer-data"
+   token = "github_pat_..."
+   passphrase = "a long phrase only you know"
+   ```
+4. **Open the app → Unlock** with your passphrase. Your views join the basket and your journal loads. From then on every change saves itself, one commit per save, so the repo's history records every edit.
+
+- **Two devices at once:** journal entries from both are combined; for a view, the device that saves last wins.
+- **On a computer:** clone `kelly-sizer-data` and run the CLI inside it (`python ../kelly-sizer/kelly.py`). It reads and writes the same `views.csv` and `journal.csv`; `git pull` before and `git push` after.
+- **Security:** the token can only touch that one repo and never appears in this one (`.streamlit/secrets.toml` is gitignored). Wrong passphrases are slowed down and limited to 5 per session, so use a long one.
 
 ## Command line
 ```bash
@@ -166,6 +184,7 @@ The book gives the principles; it doesn't give a method for a multi-name, multi-
 | `kelly.py` | The engine and the command line |
 | `app.py` | The phone app (same engine) |
 | `views.csv`, `journal.csv` | Your research and track record (not committed; shared by app and CLI) |
+| `github_store.py` | Saves your journal and views to a private GitHub repo (the app's saved data) |
 | `views.example.csv` | A starting views file |
 | `CHANGELOG.md` | What changed, by pull request |
 | `tests/` | Offline test suite (fake Yahoo data): book math, views, what-if-wrong, journal, CLI, app |
