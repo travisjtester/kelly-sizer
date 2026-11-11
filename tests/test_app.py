@@ -17,7 +17,7 @@ def app(tmp_path, monkeypatch):
 
 def size(at, tickers=("NVDA", "ASML", "KO", "MSFT", "VOO")):
     at.multiselect[0].set_value(list(tickers)).run()
-    at.button[0].click().run()
+    next(b for b in at.button if b.label == "Size it").click().run()
     assert not at.exception, at.exception
     return at
 

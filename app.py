@@ -116,6 +116,14 @@ def _same(a, b) -> bool:
     return (a_na and b_na) or (not a_na and not b_na and abs(float(a) - float(b)) < 1e-6)
 
 
+def _views_changed(a: dict, b: dict) -> bool:
+    """True if any view was added, removed or edited (blanks compare equal)."""
+    if set(a) != set(b):
+        return True
+    return any(not _same(a[t].get(k), b[t].get(k))
+               for t in a for k in set(a[t]) | set(b[t]))
+
+
 def _pct(x):
     return None if x is None or pd.isna(x) else round(float(x) * 100, 4)
 
@@ -336,6 +344,7 @@ with st.expander("Your research (views)", expanded=bool(store)):
         },
     )
     problems = []
+    before = {t: dict(v) for t, v in store.items()}
     for _, r in edited.iterrows():
         entry = {k: (r[k] / 100 if k != "value" else r[k]) if pd.notna(r[k]) else None
                  for k in VIEW_FIELDS}
@@ -357,6 +366,11 @@ with st.expander("Your research (views)", expanded=bool(store)):
             problems.append(f"**{r['ticker']}**: {e}")
     for msg in problems:
         st.error(msg)
+    # The table's computed columns (bull odds, price, margin of safety) were
+    # built from the views as they stood before this edit; rerun once so they
+    # reflect it. Blanks compare equal, so this settles after one pass.
+    if not problems and _views_changed(before, store):
+        st.rerun()
 
     up, down = st.columns(2)
     file = up.file_uploader("Load views CSV", type="csv", key="views_upload",
