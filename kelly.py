@@ -169,6 +169,16 @@ def _treasury_yield(years: int) -> float:
     raise ValueError(f"no {col} yields found")
 
 
+BOOK_MODE_RF = (0.0, "book mode: cash earns 0%")
+
+
+def risk_free_for(horizon: float, book_mode: bool = False) -> tuple[float, str]:
+    """Book mode: cash earns nothing, as in the book's Kelly formula
+    f* = (bp - q) / b (pp. 75-76), so a single bet's Kelly is exactly that
+    formula. Otherwise the horizon-matched Treasury (the tool's extension)."""
+    return BOOK_MODE_RF if book_mode else get_risk_free_rate(horizon)
+
+
 def get_risk_free_rate(horizon: float = DEFAULT_HORIZON) -> tuple[float, str]:
     """Treasury yield matched to the horizon, as a decimal, plus the source used."""
     years = _nearest_maturity(horizon, FRED_TREASURIES)
@@ -1577,6 +1587,9 @@ def main(argv: list[str] | None = None) -> int:
                    help=f"Correlation shrinkage toward independence (default {COV_SHRINK:g})")
     s.add_argument("--market-return", type=float, default=MARKET_RETURN,
                    help=f"Long-run market return for CAPM names (default {MARKET_RETURN})")
+    s.add_argument("--book-mode", action="store_true",
+                   help="Cash earns 0%%, as in the book's formula f = (bp - q)/b "
+                        "(default: the Treasury yield matched to the horizon)")
     s.add_argument("--market", action="store_true",
                    help="After sizing, show the option-implied odds beside your own odds "
                         "for each view (a reference; never used in the sizing)")
@@ -1629,7 +1642,7 @@ def main(argv: list[str] | None = None) -> int:
     if len(views):
         print(f"Using your views from {args.views}: {', '.join(views.index)}")
 
-    rf, rf_source = get_risk_free_rate(args.horizon)
+    rf, rf_source = risk_free_for(args.horizon, args.book_mode)
 
     # ---- the no-edge baseline (opt-in)
     if args.screen:

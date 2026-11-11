@@ -127,3 +127,9 @@ def test_market_check_shows_beside_your_views(app):
     assert not at.exception
     check = next(d.value for d in at.dataframe if "market_bear" in d.value.columns)
     assert list(check.ticker) == ["NVDA"] and check.your_bear.iloc[0] == pytest.approx(.25)
+
+
+def test_book_mode_toggle_puts_cash_at_zero(app):
+    next(t for t in app.toggle if t.label.startswith("Book mode")).set_value(True)
+    at = size(app)
+    assert any("Risk-free 0.00% (book mode" in c.value for c in at.caption)

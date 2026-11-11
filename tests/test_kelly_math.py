@@ -1,4 +1,5 @@
 """The book's Kelly, checked: Concentrated Investing ch. 3-4."""
+import pytest
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize_scalar
@@ -171,3 +172,13 @@ def test_sizing_is_stable_across_random_draws():
     g = [_growth(prices, views, seed=s) for s in (1, 2, 3)]
     assert max(g) - min(g) < 0.005
     assert abs(_growth(prices, views, n=4 * ks.N_SCENARIOS) - g[0]) < 0.005
+
+
+@pytest.mark.parametrize("p", [0.51, 0.6, 0.75])
+@pytest.mark.parametrize("b", [1.0, 2.0, 3.0])
+def test_book_mode_is_the_books_formula(p, b):
+    """pp. 75-76: f* = (bp - q) / b for a bet that pays b to 1 or loses the
+    stake, with idle cash earning nothing (book mode)."""
+    rf, source = ks.risk_free_for(3.0, book_mode=True)
+    assert rf == 0.0 and "book mode" in source
+    assert ks.binary_kelly(p, b, 1.0, rf) == pytest.approx((b * p - (1 - p)) / b, abs=1e-12)

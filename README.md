@@ -12,6 +12,18 @@ One engine, two ways in: a **phone app** for sizing on the couch and a **command
 3. **Size it**: joint Kelly weights for the whole basket over a buy-and-hold horizon, at the Kelly fraction you choose. Results lead with the book's risk (chance of loss, 1-in-20 worst case), then growth, invested, cash, and price swings. A **What if I'm wrong?** check shows which bets depend on your bear case being right.
 4. **Log it** to the conviction journal. When each horizon ends, record which scenario played out. The journal tells you whether your probabilities are calibrated, which decides whether you've earned bigger fractions.
 
+## Five-minute walkthrough
+On the [live app](https://kelly-sizer.streamlit.app), with the example file. Each step answers one question.
+
+1. **What does no edge look like?** Keep the default basket and tap **Size it** with no research. Every name uses CAPM: small, spread-out weights and mostly cash. Note the invested % and expected growth. That's your baseline.
+2. **What does your research change?** Download [`views.example.csv`](views.example.csv), then **Your research → Load views CSV**. KO joins the basket and NVDA, ASML and KO now carry views. Size it again. Everything that moved away from the baseline is the edge your views claim.
+3. **Which bets depend on the bear case?** Read **What if I'm wrong?**. A **Fragile** name loses most of its size if the bear case is a little worse than you said.
+4. **Does the market agree?** Open **Market check** and turn on the toggle. Your odds sit beside the option-implied odds. Every gap of 10+ points is a claim you should be able to explain.
+5. **Is it the edge or the shape?** In **Settings**, turn on **Neutral inputs**. Your views keep their shape but lose their edge, and the sizes fall back toward the baseline. Turn it off again.
+6. **Will you remember this call?** Under **Conviction journal**, tap **Log today's views**, then **Save journal CSV**. When each horizon ends, record what happened. After 10 resolved calls the journal tells you whether your odds are calibrated.
+
+Same thing at a desk: `python kelly.py --views views.example.csv NVDA ASML KO MSFT VOO --market`.
+
 ## Phone app
 ```bash
 python -m streamlit run app.py          # local: http://localhost:8501
@@ -49,16 +61,17 @@ python kelly.py --screen --extra TSM ASML              # opt-in: S&P 500 no-edge
 | Correlation shrinkage | Settings | `--shrink` | 0.20 |
 | Long-run market return (CAPM) | Settings | `--market-return` | 10.68% |
 | Neutral inputs (test mode) | Settings | `--neutral` | off |
+| Book mode (cash earns 0%) | Settings | `--book-mode` | off |
 | Market check | Market check (after your odds) | `--market` | off |
 
 **Neutral inputs** scales each view so its expected return equals its CAPM return while keeping its shape (the spread between bear, base and bull). With the edge removed, sizes should land near the no-views baseline; whatever gap remains is the scenario shape alone. Use it to test a set of inputs, such as analyst targets, not to size.
 
 ## Your views
 ```csv
-ticker,p_bear,bear,p_base,base,bull,value,notes
-NVDA,0.25,0.50,0.35,0.15,1.00,,"Bear: capex bust, permanent derating"
-ASML,0.20,0.35,0.40,0.20,,1100,"Bull from intrinsic value $1,100/share"
-KO,0.10,0.15,,,0.30,,"Two outcomes only: base left blank"
+ticker,p_bear,bear,p_base,base,bull,value,notes,as_of_price,horizon
+NVDA,0.25,0.50,0.35,0.15,1.00,,"Bear: capex bust, permanent derating",185.00,3
+ASML,0.20,0.35,0.40,0.20,,1100,"Bull from intrinsic value $1,100/share",,3
+KO,0.10,0.15,,,0.30,,"Two outcomes only: base left blank",,
 ```
 
 | Column | Meaning |
@@ -111,22 +124,41 @@ Each logged view records the date, entry price and your scenarios. When the hori
 Solo Kelly for every S&P 500 name under CAPM (plus `--extra` names and your views), saved to `kelly_screen_YYYY-MM-DD.csv`. CAPM assumes no edge, so this ranks **risk structure, not opportunities**. It's a reference point for comparing your views, not a source of ideas. The book's ideas come from research.
 
 ## How the book maps to the tool
+Page numbers are *Concentrated Investing*'s printed pages, checked against the text (November 2026).
 
-| Book (page) | Tool |
+### From the book
+| The book (page) | In the tool |
 |---|---|
-| Kelly maximizes expected log of wealth; edge/odds; no edge, no bet (pp. 75–76) | The objective everywhere; reproduces the book's example (51% at even money → 2%) |
-| Kelly never risks ruin (p. 86) | Ruinous mixes score −∞; solo Kelly is bounded below the ruin point |
-| Edge from research on probability and risk/reward (p. 2) | Your bear / base / bull scenarios |
-| Risk = permanent loss of capital, not volatility (p. 3) | Bear = permanent loss; results lead with chance of loss; volatility labeled "price swings" |
+| Kelly maximizes the expected log of wealth; edge/odds; no edge, no bet (pp. 75–76) | The objective everywhere; reproduces the book's example (51% at even money → 2%) |
+| The formula: f* = (bp − q)/b, with idle cash earning nothing (pp. 75–76) | **Book mode** (`--book-mode`): cash at 0%, so a single bet's Kelly is exactly this formula |
+| Kelly sizes from probability (chance of winning vs. losing) and risk vs. reward (p. 1) | Your odds and payoffs for each scenario |
+| Concentration is only for those prepared to do intensive research (Preface, p. xi) | Views come from your research; names without one get no edge |
+| "Know-nothing" investors should treat markets as efficient and index (p. 3) | No view → sized as plain market exposure under CAPM; `--screen` labeled as the no-edge baseline |
+| Risk is the permanent loss of capital, not volatility (p. 3) | Bear = permanent loss; results lead with chance of loss; volatility labeled "price swings" |
 | Margin of safety (pp. 3, 208) | `value` input → bull case and margin-of-safety column |
-| Size bets jointly; isolated Kelly "generally overestimates" (p. 105) | One solve for the whole basket; solo Kelly shown as a ceiling |
-| Kelly is the maximum bet; half Kelly ≈ ¾ of the growth, ½ the volatility (pp. 85–86) | Fractions = c × the Kelly bet, then caps; default half |
-| Buffett: "25 percent for the largest," up to 40% (p. 96) | Default 25%; app ceiling 40%; CLI warns above it |
-| Concentrate in 5–20 names (p. 3) | Up to 15 in the app |
-| Buy and hold; Shannon didn't trim (p. 82) | Buy-and-hold horizon |
-| Bet only on a mispriced bet: "look and sift the world for a mispriced bet" (Munger, pp. 209–210) | Market check: your odds beside option-implied odds, revealed after you enter yours; never used in sizing |
-| Kelly needs accurate probabilities; misjudged downside overstates the bet (p. 105) | "What if I'm wrong?" stress test on every result, plus the conviction journal's calibration over time |
-| "Know-nothing" investors should index (p. 3) | No view → sized as market exposure under CAPM; `--screen` labeled as the no-edge baseline |
+| The book's investors hold anywhere from 5 to 20 securities (p. 3) | Up to 15 names in the app |
+| Kelly never risks ruin (p. 86) | Ruinous mixes score −∞; solo Kelly is bounded below the ruin point |
+| Kelly is the maximum bet; half Kelly gives ¾ of the growth with ½ the volatility (pp. 85–86) | Fractions = c × the Kelly bet, then caps; default half |
+| Buffett: 80% in five positions, "25 percent for the largest," once up to 40% (p. 96) | Default 25% per name; app ceiling 40%; CLI warns above it |
+| Shannon didn't trim positions as they grew (pp. 81–82) | Buy-and-hold horizon; no rebalancing |
+| Size bets jointly: Kelly in isolation "generally overestimates" (Thorp, p. 105) | One solve for the whole basket; solo Kelly shown as a ceiling |
+| Misjudging the lower bound, or its odds, overstates the bet (Thorp, p. 105) | "What if I'm wrong?" on every result |
+| Winning bettors "look and sift the world for a mispriced bet" (Munger, pp. 209–210) | Market check: your odds beside the market's, revealed after you enter yours; never used in sizing |
+
+### The tool's extensions (not in the book)
+The book gives the principles; it doesn't give a method for a multi-name, multi-outcome portfolio. These fill that gap.
+
+| Extension | Why |
+|---|---|
+| Bear / base / bull scenarios instead of one win/lose bet | Lets bear mean a broken thesis while keeping a middle case. With two outcomes and cash at 0% it reduces to the book's formula |
+| CAPM for names without a view | Lets an index or a no-view name sit in a basket as plain market exposure, with no edge |
+| Joint sizing over 20,000 simulated outcomes (Student-t copula on historical correlations) | The book asks for joint sizing (p. 105) but gives no method. The t-copula makes bad outcomes cluster, as in a crash |
+| Cash earns the Treasury yield matched to the horizon | Idle cash really does earn something; book mode turns this off |
+| Fractional Kelly solved with your caps scaled by 1/c, then scaled down | Half Kelly is half the Kelly bet, trimmed to your caps, not half of an already-capped bet |
+| The two stresses in "What if I'm wrong?" (+10 points of bear odds, 1.5× deeper bear) | The warning is Thorp's (p. 105); the stress sizes are the tool's |
+| Conviction journal with calibration and a Brier score | The book says Kelly needs accurate odds; the journal checks yours |
+| Market check's option math | The question is Munger's; reading option chains is the tool's |
+| Stale-view re-anchoring, horizon flag, neutral inputs | Guardrails on your inputs |
 
 ## Files
 | File | What it is |
@@ -135,6 +167,7 @@ Solo Kelly for every S&P 500 name under CAPM (plus `--extra` names and your view
 | `app.py` | The phone app (same engine) |
 | `views.csv`, `journal.csv` | Your research and track record (not committed; shared by app and CLI) |
 | `views.example.csv` | A starting views file |
+| `CHANGELOG.md` | What changed, by pull request |
 | `tests/` | Offline test suite (fake Yahoo data): book math, views, what-if-wrong, journal, CLI, app |
 
 **Outputs** (decimals: 0.12 = 12%):
