@@ -137,6 +137,7 @@ Each logged view records the date, entry price and your scenarios. When the hori
 - **calibration**: for the bull odds you gave (<40%, 40–60%, 60–80%, 80%+), how often bull happened
 - **Brier score** (0 = perfect) and the average probability you gave to what actually happened
 - a verdict after 10+ resolved calls: well calibrated, running hot (lower your odds or bet a smaller fraction), or underconfident
+- **you vs. the market**: each entry also records the market's odds at the time (Market check), when options trade. After 10+ resolved calls that have them, your odds and the market's are scored on the same calls. If the market keeps scoring better, your edge may not be real, and the verdict says to bet a smaller fraction. The market's odds price the share price at the option expiry, while your outcomes judge the thesis, so the two answer close but not identical questions. Older journals without these columns still load.
 
 ## The no-edge baseline (`--screen`)
 Solo Kelly for every S&P 500 name under CAPM (plus `--extra` names and your views), saved to `kelly_screen_YYYY-MM-DD.csv`. CAPM assumes no edge, so this ranks **risk structure, not opportunities**. It's a reference point for comparing your views, not a source of ideas. The book's ideas come from research.

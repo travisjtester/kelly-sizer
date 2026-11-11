@@ -44,3 +44,51 @@ def test_journal_round_trips_through_csv(tmp_path):
     j.to_csv(p, index=False)
     back = ks.load_journal(p)
     assert len(back) == 3 and list(back.outcome) == ["bull", "base", "base"]
+
+
+def _resolved(n, you_bear, mkt_bear, outcome="bear"):
+    """n resolved calls where you and the market gave the bear case these odds."""
+    return ks.normalize_journal(pd.DataFrame({
+        "date": [date(2023, 1, 1)] * n, "ticker": [f"T{i}" for i in range(n)],
+        "horizon_years": 1, "p_bear": you_bear, "bear": .4, "p_base": 0.0,
+        "p_bull": 1 - you_bear, "bull": .5, "outcome": outcome,
+        "market_bear": mkt_bear, "market_bull": 1 - mkt_bear}))
+
+
+def test_older_journals_without_market_columns_still_load():
+    old = pd.DataFrame({"date": ["2025-01-02"], "ticker": ["NVDA"], "p_bear": [.2],
+                        "bear": [.5], "p_bull": [.8], "bull": [1.0]})
+    j = ks.normalize_journal(old)
+    assert {"market_bear", "market_bull", "market_expiry"} <= set(j.columns)
+    assert j.market_bear.isna().all() and j.market_expiry.iloc[0] == ""
+
+
+def test_logging_records_the_markets_odds_beside_yours():
+    views = ks.resolve_views(ks.normalize_views(pd.DataFrame(
+        {"ticker": ["AAA", "BBB"], "p_bear": [.2, .3], "bear": [.4, .5], "bull": [.6, .9]})),
+        {"AAA": 50.0, "BBB": 20.0})
+    market = pd.DataFrame({"ticker": ["AAA", "BBB"], "market_bear": [.31, float("nan")],
+                           "market_bull": [.22, float("nan")],
+                           "expiry": ["2028-01-21", None]})
+    e = ks.journal_entries(views, 2.0, on=date(2026, 11, 11), market=market).set_index("ticker")
+    assert e.at["AAA", "market_bear"] == .31 and e.at["AAA", "market_expiry"] == "2028-01-21"
+    assert pd.isna(e.at["BBB", "market_bear"]) and e.at["BBB", "market_expiry"] == ""
+
+
+def test_you_beat_the_market_when_your_odds_were_better():
+    _, s, _ = ks.journal_report(_resolved(12, you_bear=.8, mkt_bear=.2), today=date(2026, 1, 1))
+    assert s["market_calls"] == 12 and s["your_brier_vs"] < s["market_brier"]
+    assert "Your odds beat the market's on 12 calls" in s["market_verdict"]
+
+
+def test_the_market_beats_you_and_says_bet_smaller():
+    _, s, _ = ks.journal_report(_resolved(12, you_bear=.1, mkt_bear=.7), today=date(2026, 1, 1))
+    assert "The market's odds beat yours" in s["market_verdict"]
+    assert "bet a smaller fraction" in s["market_verdict"]
+
+
+def test_market_comparison_waits_for_enough_calls():
+    _, s, _ = ks.journal_report(_resolved(4, .8, .2), today=date(2026, 1, 1))
+    assert "needs 10+" in s["market_verdict"]
+    _, s2, _ = ks.journal_report(_resolved(12, .8, float("nan")), today=date(2026, 1, 1))
+    assert s2["market_calls"] == 0 and "market_verdict" not in s2   # no market odds logged
