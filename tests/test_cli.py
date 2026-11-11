@@ -90,3 +90,18 @@ def test_market_flag_prints_the_check(tmp_path, monkeypatch, capsys):
 def test_book_mode_flag_puts_cash_at_zero(tmp_path, monkeypatch, capsys):
     assert run(tmp_path, monkeypatch, "NVDA", "KO", "--book-mode", "--no-save") == 0
     assert "Risk-free 0.00% (book mode: cash earns 0%)" in capsys.readouterr().out
+
+
+def test_street_flag_starts_blank_names_from_targets(tmp_path, monkeypatch, capsys):
+    class T:
+        def __init__(self, t):
+            self.info = {"currentPrice": 199.86, "targetLowPrice": 140.0,   # fake MSFT ~$200
+                         "targetMeanPrice": 240.0, "targetHighPrice": 300.0,
+                         "numberOfAnalystOpinions": 20} if t == "MSFT" else {}
+    monkeypatch.setattr("yfinance.Ticker", T)
+    assert run(tmp_path, monkeypatch, "MSFT", "KO", "--street") == 0
+    out = capsys.readouterr().out
+    assert "Street starter for 1 of 2 names" in out and "KO: skipped" in out
+    assert "Sized on your research for 1 of 2" in out
+    saved = pd.read_csv(next((tmp_path / "out").glob("street_views_*.csv")))
+    assert list(saved.ticker) == ["MSFT"] and saved.horizon.iloc[0] == 1

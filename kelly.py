@@ -496,6 +496,82 @@ def market_gaps(check: pd.DataFrame) -> list[str]:
     return out
 
 
+# ------------------------------------------------------- street starter ---
+# A consensus starting point, not an edge. Analysts' low / mean / high
+# 12-month price targets become a bear / base / bull view with placeholder odds,
+# for names you haven't researched yet, so there's something to edit rather
+# than a blank row. Sell-side targets lean bullish (the first live test sized
+# them at 41%/yr expected growth vs. 6.8% with no views), so every starter view
+# is labeled, carries horizon = 1 (targets are 12-month, so a longer run flags
+# the mismatch) and as_of_price (so it re-anchors as the price moves). The
+# book's edge comes from your own research (p. 1, Preface p. xi): replace the
+# odds and the bear case with yours.
+STREET_ODDS = (0.20, 0.50)        # placeholder bear / base odds; bull gets the rest
+STREET_BEAR_FLOOR = 0.20          # a low target isn't a broken thesis: at least a 20% loss
+STREET_NOTE = "Street consensus starter: replace the odds and bear case with your research"
+
+
+def street_targets(tickers: list[str]) -> pd.DataFrame:
+    """Analyst price targets from Yahoo: low / mean / high, analyst count and
+    the current price. Best effort: a name without targets gets a note."""
+    import yfinance as yf
+
+    rows = []
+    for t in tickers:
+        r = {"ticker": t, "price": np.nan, "low": np.nan, "mean": np.nan, "high": np.nan,
+             "analysts": np.nan, "note": ""}
+        try:
+            info = yf.Ticker(t).info or {}
+            r.update(price=info.get("currentPrice") or info.get("regularMarketPrice"),
+                     low=info.get("targetLowPrice"), mean=info.get("targetMeanPrice"),
+                     high=info.get("targetHighPrice"),
+                     analysts=info.get("numberOfAnalystOpinions"))
+        except Exception as e:
+            r["note"] = f"targets unavailable ({type(e).__name__})"
+        rows.append(r)
+    out = pd.DataFrame(rows)
+    num = ["price", "low", "mean", "high", "analysts"]
+    out[num] = out[num].apply(pd.to_numeric, errors="coerce")
+    return out
+
+
+def street_views(targets: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Starter views from street_targets(), and notes on each name: which were
+    skipped and why, and where the bear case was floored (a low target above
+    the price, or barely below it, isn't a permanent loss).
+    """
+    p_bear, p_base = STREET_ODDS
+    rows, notes = [], []
+    for _, r in targets.iterrows():
+        t = r["ticker"]
+        if r["note"]:
+            notes.append(f"{t}: skipped, {r['note']}")
+            continue
+        if not all(pd.notna(r[c]) and r[c] > 0 for c in ["price", "low", "mean", "high"]):
+            notes.append(f"{t}: skipped, no analyst price targets")
+            continue
+        S = r["price"]
+        bull = r["high"] / S - 1
+        if bull <= 0:
+            notes.append(f"{t}: skipped, already above the highest target (${r['high']:,.2f})")
+            continue
+        raw_bear = 1 - r["low"] / S
+        bear = min(max(raw_bear, STREET_BEAR_FLOOR), 0.95)
+        n = f"{r['analysts']:.0f} analysts; " if pd.notna(r["analysts"]) else ""
+        rows.append({"ticker": t, "p_bear": p_bear, "bear": round(bear, 4), "p_base": p_base,
+                     "base": round(r["mean"] / S - 1, 4), "bull": round(bull, 4),
+                     "as_of_price": S, "horizon": 1.0,
+                     "notes": f"{STREET_NOTE} ({n}low/mean/high ${r['low']:,.0f}/"
+                              f"${r['mean']:,.0f}/${r['high']:,.0f})"})
+        if raw_bear < STREET_BEAR_FLOOR:
+            why = ("above the price" if raw_bear <= 0 else f"only {raw_bear:.0%} below it")
+            notes.append(f"{t}: lowest target is {why}, so the bear case is set at a "
+                         f"{STREET_BEAR_FLOOR:.0%} loss. Write your own.")
+    views = normalize_views(pd.DataFrame(rows)) if rows else normalize_views(None)
+    return views, notes
+
+
 # ---------------------------------------------------------------- views ---
 # A view is up to three outcomes for a thesis over the horizon:
 #   bear : PERMANENT loss of capital (the book's definition of risk), prob p_bear
@@ -1654,6 +1730,10 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--book-mode", action="store_true",
                    help="Cash earns 0%%, as in the book's formula f = (bp - q)/b "
                         "(default: the Treasury yield matched to the horizon)")
+    s.add_argument("--street", action="store_true",
+                   help="Names without a view start from analysts' low/mean/high price "
+                        "targets (a labeled consensus starter with placeholder odds; saved "
+                        "to street_views_DATE.csv to edit into your views)")
     s.add_argument("--market", action="store_true",
                    help="After sizing, show the option-implied odds beside your own odds "
                         "for each view (a reference; never used in the sizing)")
@@ -1733,6 +1813,19 @@ def main(argv: list[str] | None = None) -> int:
     if prices.empty or BENCHMARK not in prices.columns:
         print("ERROR: no price data came back from Yahoo. Try again in a minute.")
         return 1
+    if args.street:
+        missing = [t for t in tickers if t not in views.index and t != BENCHMARK]
+        starter, notes = street_views(street_targets(missing)) if missing else (
+            normalize_views(None), [])
+        print(f"\nStreet starter for {len(starter)} of {len(missing)} names without a view "
+              f"(consensus 12-month targets, placeholder odds; not your edge):")
+        for n in notes:
+            print("  " + n)
+        if len(starter):
+            views = pd.concat([views, starter])
+            if not args.no_save:
+                print(f"  Saved: {safe_to_csv(starter.reset_index(), out_dir / f'street_views_{stamp}.csv')}"
+                      " (edit it, then merge it into your views)")
     in_basket = views.loc[[t for t in tickers if t in views.index]]
     prices_now = download_latest_prices(list(in_basket.index)) if len(in_basket) else {}
     meta = basket_meta(tickers)

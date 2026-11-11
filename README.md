@@ -80,6 +80,7 @@ python kelly.py --screen --extra TSM ASML              # opt-in: S&P 500 no-edge
 | Long-run market return (CAPM) | Settings | `--market-return` | 10.68% |
 | Neutral inputs (test mode) | Settings | `--neutral` | off |
 | Book mode (cash earns 0%) | Settings | `--book-mode` | off |
+| Street starter for blank rows | Your research → Start blank rows from Street targets | `--street` | off |
 | Market check | Market check (after your odds) | `--market` | off |
 
 **Neutral inputs** scales each view so its expected return equals its CAPM return while keeping its shape (the spread between bear, base and bull). With the edge removed, sizes should land near the no-views baseline; whatever gap remains is the scenario shape alone. Use it to test a set of inputs, such as analyst targets, not to size.
@@ -104,6 +105,11 @@ KO,0.10,0.15,,,0.30,,"Two outcomes only: base left blank",,
 
 Bull odds = `1 − p_bear − p_base`. **Units:** use one style per file. The odds columns decide it: odds written as percents (`40`) mean the whole file is percents; decimals (`0.4`) mean decimals. A `%` sign always means percent. Older `p_win, upside, downside` files still load. Start from `views.example.csv`.
 
+
+### Street starter: a consensus starting point
+For names you haven't researched yet, **Start blank rows from Street targets** (CLI `--street`) turns analysts' 12-month price targets into a view you can edit: low → bear, mean → base, high → bull, with placeholder odds of 20 / 50 / 30. It never touches a view you've written.
+
+It's a starting point, not an edge. Sell-side targets lean bullish (the first live test sized them at 41%/yr expected growth, against 6.8% with no views), so each starter view is labeled, carries `horizon = 1` (a longer run flags it) and today's `as_of_price` (so it re-anchors as the price moves). A low target above the price isn't a broken thesis, so the bear case is set at no less than a 20% loss and you're told to write your own. Replace the odds and the bear case with your research; **Neutral inputs** and **Market check** help you test what's left. On the CLI the starter views are saved to `street_views_DATE.csv` for you to edit into `views.csv`.
 
 ### Market check: your odds vs. the market's
 Munger's winning bettors "look and sift the world for a mispriced bet" (pp. 209–210). Option prices are the market's odds; your edge is where your odds differ. **Market check** shows, for each name you have a view on, the option-implied chance of finishing below your bear price and above your bull price, beside your own odds, with a sentence wherever the gap is 10 points or more.

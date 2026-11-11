@@ -379,6 +379,24 @@ with st.expander("Your research (views)", expanded=bool(store)):
         down.download_button("Save views CSV", csv, "views.csv", "text/csv",
                              width="stretch")
 
+    # ---- Street starter: a labeled consensus starting point for blank rows
+    blank = [t for t in tickers if t not in store and t != ks.BENCHMARK]
+    if blank and st.button(
+            f"Start blank rows from Street targets ({len(blank)})", width="stretch",
+            help="Fills names without a view from analysts' low / mean / high 12-month "
+                 "price targets, with placeholder odds (20 / 50 / 30). A consensus "
+                 "starting point to edit, not an edge."):
+        with st.spinner("Reading analyst price targets…"):
+            starter, notes = ks.street_views(ks.street_targets(blank))
+        store.update({t: {k: r[k] for k in STORE_FIELDS} for t, r in starter.iterrows()})
+        st.session_state._upload_notes = [
+            f"Filled {len(starter)} of {len(blank)} blank rows from Street targets: "
+            "12-month consensus, which leans bullish, with placeholder odds. That's the "
+            "market's view, not your edge: replace the odds and the bear case with your own "
+            "research. Neutral inputs and Market check help test them.",
+            *notes]
+        st.rerun()
+
 c1, c2 = st.columns(2)
 fraction_label = c1.radio("Kelly fraction", list(FRACTIONS), index=1, horizontal=True)
 amount = c2.number_input("Amount to allocate ($)", min_value=0, value=10_000, step=1_000)
