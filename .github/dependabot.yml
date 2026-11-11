@@ -1,0 +1,18 @@
+# Weekly update PRs for Python packages and GitHub Actions. Each one runs the
+# test suite like any other PR, and main only accepts it if the tests pass.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      python:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
