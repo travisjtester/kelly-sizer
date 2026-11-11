@@ -1179,9 +1179,18 @@ def what_if_message(by_name: pd.DataFrame, held: pd.DataFrame) -> str:
 # with the date and entry price; later you record which scenario actually
 # played out (judge the thesis, not the price: a drop isn't a permanent loss).
 # Calibration then shows whether your 60% calls come true about 60% of the time.
+#
+# Each entry also records the market's odds at the time (market check), when
+# options were available: the chance of finishing below your bear price and
+# above your bull price at market_expiry. Once enough calls resolve, the
+# journal scores your odds and the market's on the same calls. If the market
+# keeps scoring better, your edge may not be real (Munger, pp. 209-210: bet
+# only on a mispriced bet). Older journals without these columns still load.
 JOURNAL_COLS = ["date", "ticker", "horizon_years", "entry_price", "value",
                 "p_bear", "bear", "p_base", "base", "p_bull", "bull",
-                "notes", "outcome", "outcome_date"]
+                "notes", "outcome", "outcome_date",
+                "market_bear", "market_bull", "market_expiry"]
+MIN_RESOLVED = 10    # resolved calls before calibration verdicts mean anything
 OUTCOMES = ["bear", "base", "bull"]
 
 
@@ -1199,8 +1208,10 @@ def normalize_journal(df: pd.DataFrame | None) -> pd.DataFrame:
     j["outcome"] = (j["outcome"].astype(str).str.strip().str.lower()
                     .where(lambda s: s.isin(OUTCOMES), ""))
     num = ["horizon_years", "entry_price", "value", "p_bear", "bear", "p_base",
-           "base", "p_bull", "bull"]
+           "base", "p_bull", "bull", "market_bear", "market_bull"]
     j[num] = j[num].apply(pd.to_numeric, errors="coerce")
+    j["market_expiry"] = j["market_expiry"].fillna("").astype(str).replace("nan", "")
+    j[["market_bear", "market_bull"]] = j[["market_bear", "market_bull"]].round(6)
     j["notes"] = j["notes"].fillna("").astype(str).replace("nan", "")
     j[["p_bear", "bear", "p_base", "base", "p_bull", "bull"]] = (
         j[["p_bear", "bear", "p_base", "base", "p_bull", "bull"]].round(6))
@@ -1214,8 +1225,10 @@ def load_journal(path: Path | str) -> pd.DataFrame:
 
 
 def journal_entries(resolved_views: pd.DataFrame, horizon: float,
-                    on: date | None = None) -> pd.DataFrame:
-    """Rows for today's views (output of resolve_views), ready to append."""
+                    on: date | None = None,
+                    market: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Rows for today's views (output of resolve_views), ready to append.
+    market: a market_check table; its odds are recorded beside yours."""
     on = on or date.today()
     v = resolved_views.reset_index()
     rows = pd.DataFrame({
@@ -1224,7 +1237,55 @@ def journal_entries(resolved_views: pd.DataFrame, horizon: float,
         **{c: v[c] for c in ["p_bear", "bear", "p_base", "base", "p_bull", "bull"]},
         "notes": v.get("notes", ""), "outcome": "", "outcome_date": pd.NaT,
     })
+    if market is not None and len(market):
+        m = market.set_index("ticker")
+        rows["market_bear"] = rows["ticker"].map(m["market_bear"])
+        rows["market_bull"] = rows["ticker"].map(m["market_bull"])
+        rows["market_expiry"] = rows["ticker"].map(m["expiry"]).fillna("")
     return normalize_journal(rows)
+
+
+def _brier(P: np.ndarray, outcomes: pd.Series) -> float:
+    """Mean Brier score over bear/base/bull (0 = perfect, 2 = certain and wrong)."""
+    Y = np.stack([(outcomes == o).to_numpy(float) for o in OUTCOMES], axis=1)
+    return float(np.mean(np.sum((P - Y) ** 2, axis=1)))
+
+
+def market_vs_you(resolved: pd.DataFrame) -> dict:
+    """
+    Your odds and the market's, scored on the same resolved calls (those that
+    have market odds). The market's base odds are what's left after its bear
+    and bull odds. Caveat, stated wherever this is shown: the market's odds
+    are about the price at the option expiry and are risk-neutral, while your
+    outcomes judge the thesis, so the two answer slightly different questions.
+    """
+    both = resolved.dropna(subset=["market_bear", "market_bull"])
+    out = {"market_calls": len(both)}
+    if not len(both):
+        return out
+    mb, mu = both["market_bear"].to_numpy(), both["market_bull"].to_numpy()
+    P_mkt = np.stack([mb, np.clip(1 - mb - mu, 0, 1), mu], axis=1)
+    P_you = both[["p_bear", "p_base", "p_bull"]].fillna(0).to_numpy()
+    out["your_brier_vs"] = _brier(P_you, both["outcome"])
+    out["market_brier"] = _brier(P_mkt, both["outcome"])
+    if len(both) < MIN_RESOLVED:
+        out["market_verdict"] = (f"{len(both)} resolved calls have the market's odds beside "
+                                 f"yours; the comparison needs {MIN_RESOLVED}+.")
+    elif out["your_brier_vs"] < out["market_brier"] - 0.02:
+        out["market_verdict"] = (
+            f"Your odds beat the market's on {len(both)} calls (Brier "
+            f"{out['your_brier_vs']:.2f} vs {out['market_brier']:.2f}). Evidence your edge "
+            f"is real.")
+    elif out["your_brier_vs"] > out["market_brier"] + 0.02:
+        out["market_verdict"] = (
+            f"The market's odds beat yours on {len(both)} calls (Brier "
+            f"{out['market_brier']:.2f} vs {out['your_brier_vs']:.2f}). Your edge may not be "
+            f"real: bet a smaller fraction until that changes.")
+    else:
+        out["market_verdict"] = (
+            f"Your odds and the market's score about the same on {len(both)} calls (Brier "
+            f"{out['your_brier_vs']:.2f} vs {out['market_brier']:.2f}). No clear edge yet.")
+    return out
 
 
 def append_journal(journal: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
@@ -1264,15 +1325,16 @@ def journal_report(journal: pd.DataFrame, prices_now: dict[str, float] | None = 
     if len(res):
         P = res[["p_bear", "p_base", "p_bull"]].fillna(0).to_numpy()
         Y = np.stack([(res["outcome"] == o).to_numpy(float) for o in OUTCOMES], axis=1)
-        summary["brier"] = float(np.mean(np.sum((P - Y) ** 2, axis=1)))
+        summary["brier"] = _brier(P, res["outcome"])
         summary["avg_prob_of_actual"] = float(np.mean(np.sum(P * Y, axis=1)))
+        summary.update(market_vs_you(res))
         for o, col in zip(OUTCOMES, ["p_bear", "p_base", "p_bull"]):
             summary[f"predicted_{o}"] = float(res[col].fillna(0).mean())
             summary[f"actual_{o}"] = float((res["outcome"] == o).mean())
         gap = summary["predicted_bull"] - summary["actual_bull"]
         summary["verdict"] = (
-            "Too few resolved calls to judge calibration yet (aim for 10+)."
-            if len(res) < 10 else
+            f"Too few resolved calls to judge calibration yet (aim for {MIN_RESOLVED}+)."
+            if len(res) < MIN_RESOLVED else
             f"Your bull calls run hot: you predicted {summary['predicted_bull']:.0%}, "
             f"{summary['actual_bull']:.0%} came true. Lower your odds or bet a smaller fraction."
             if gap > 0.10 else
@@ -1537,6 +1599,8 @@ def print_journal(journal: pd.DataFrame) -> None:
         print(f"  {s['verdict']}")
         print(f"  Brier score {s['brier']:.2f} (0 = perfect) · on average you gave "
               f"{s['avg_prob_of_actual']:.0%} odds to what actually happened")
+        if s.get("market_verdict"):
+            print(f"  You vs. the market: {s['market_verdict']}")
         print("  " + _fmt_table(calib.rename(columns={
             "bucket": "Bull odds you gave", "calls": "Calls",
             "predicted_bull": "Predicted", "actual_bull": "Came true"}),
@@ -1745,7 +1809,9 @@ def main(argv: list[str] | None = None) -> int:
         else:
             last = prices.ffill().iloc[-1].to_dict()
             resolved = resolve_views(in_basket, {**last, **prices_now})
-            journal = append_journal(journal, journal_entries(resolved, args.horizon))
+            market = market_check(in_basket, {**last, **prices_now}, args.horizon, rf)
+            journal = append_journal(journal, journal_entries(resolved, args.horizon,
+                                                              market=market))
             safe_to_csv(journal, args.journal)
             print(f"Logged {len(resolved)} views to {args.journal}")
     if len(journal):

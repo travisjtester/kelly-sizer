@@ -26,6 +26,7 @@ def test_uses_views_csv_and_logs_to_journal(tmp_path, monkeypatch, capsys):
     assert "What if I'm wrong?" in out and "Verdict" in out
     j = ks.load_journal(tmp_path / "journal.csv")
     assert set(j.ticker) == {"NVDA", "ASML", "KO"} and j.entry_price.notna().all()
+    assert {"market_bear", "market_bull", "market_expiry"} <= set(j.columns)   # recorded, blank without option data
 
 
 def test_no_tickers_sizes_the_views(tmp_path, monkeypatch, capsys):
