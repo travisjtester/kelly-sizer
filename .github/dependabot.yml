@@ -4,6 +4,11 @@ version: 2
 updates:
   - package-ecosystem: pip
     directory: /
+    # requirements.txt holds minimums (>=), so the newest versions install
+    # anyway and the weekly test run catches breakage. Only raise a minimum
+    # when the current one blocks a newer version; raising them all to the
+    # latest dropped Python 3.11 support (numpy 2.5 needs 3.12).
+    versioning-strategy: increase-if-necessary
     schedule:
       interval: weekly
       day: monday
