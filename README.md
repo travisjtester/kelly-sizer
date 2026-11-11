@@ -188,6 +188,7 @@ The book gives the principles; it doesn't give a method for a multi-name, multi-
 | `github_store.py` | Saves your journal and views to a private GitHub repo (the app's saved data) |
 | `views.example.csv` | A starting views file |
 | `CHANGELOG.md` | What changed, by pull request |
+| `LICENSE` | MIT |
 | `tests/` | Offline test suite (fake Yahoo data): book math, views, what-if-wrong, journal, CLI, app |
 
 **Outputs** (decimals: 0.12 = 12%):
@@ -217,3 +218,8 @@ Data sources: constituents from Wikipedia (GitHub dataset fallback); the Treasur
 - Correlations between theses come from how the stocks' prices moved together. For idiosyncratic theses that likely overstates the link; raise the shrinkage.
 - Extras (e.g. TSM, ASML ADRs) are priced in USD, so FX is in their returns.
 - Not financial advice.
+
+## License
+[MIT](LICENSE). Use it, change it, share it; keep the copyright notice. The book belongs to its authors and publisher: this repo cites it, it doesn't reproduce it.
+
+Not financial advice. Kelly Sizer turns your own estimates into position sizes; it can't tell you whether those estimates are right.
