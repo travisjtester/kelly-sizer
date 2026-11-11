@@ -60,8 +60,8 @@ def verdict_colors() -> dict:
 
 # ------------------------------------------------------------- cached data ---
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def risk_free(horizon: float) -> tuple[float, str]:
-    return ks.get_risk_free_rate(horizon)
+def risk_free(horizon: float, book_mode: bool = False) -> tuple[float, str]:
+    return ks.risk_free_for(horizon, book_mode)
 
 
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
@@ -289,6 +289,11 @@ with st.expander("Settings"):
                             "theses are less linked than the stocks' prices.")
     mkt_ret = st.number_input("Long-run market return (CAPM names)", 0.0, 0.30,
                               ks.MARKET_RETURN, 0.005, format="%.4f")
+    book_mode = st.toggle(
+        "Book mode: cash earns 0%", value=False,
+        help="The book's Kelly formula, f = (bp − q) / b (pp. 75–76), assumes idle cash "
+             "earns nothing. On: cash earns 0%, exactly as in the book. Off (default): "
+             "cash earns the Treasury yield matched to your horizon, the tool's extension.")
     neutral = st.toggle(
         "Neutral inputs (test mode)", value=False,
         help="Scale each view to its CAPM return while keeping its shape, so there's "
@@ -303,7 +308,7 @@ with st.expander("Market check: your odds vs. the market's"):
                    "hidden until you've committed to your own, so they can't anchor you.")
     elif st.toggle("Show the market's odds for my views", key="show_market"):
         with st.spinner("Reading option prices…"):
-            rf_mc, _ = risk_free(horizon)
+            rf_mc, _ = risk_free(horizon, book_mode)
             px_mc = latest_for(tuple(sorted(in_views)))
             mine = ks.normalize_views(pd.DataFrame([{"ticker": t, **v}
                                                     for t, v in in_views.items()]))
@@ -356,7 +361,7 @@ else:
                                               for t, v in in_basket.items()]))
              if in_basket else None)
     with st.spinner("Pulling prices and solving…"):
-        rf, rf_src = risk_free(horizon)
+        rf, rf_src = risk_free(horizon, book_mode)
         prices = prices_for(tuple(sorted(tickers)))
         prices_now = latest_for(tuple(sorted(in_basket))) if in_basket else {}
         if prices.empty or ks.BENCHMARK not in prices.columns:

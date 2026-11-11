@@ -84,3 +84,8 @@ def test_market_flag_prints_the_check(tmp_path, monkeypatch, capsys):
     assert run(tmp_path, monkeypatch, "NVDA", "KO", "VOO", "--market", "--no-save") == 0
     out = capsys.readouterr().out
     assert "Market check" in out and "option data unavailable" in out   # fake Yahoo: no chains
+
+
+def test_book_mode_flag_puts_cash_at_zero(tmp_path, monkeypatch, capsys):
+    assert run(tmp_path, monkeypatch, "NVDA", "KO", "--book-mode", "--no-save") == 0
+    assert "Risk-free 0.00% (book mode: cash earns 0%)" in capsys.readouterr().out
