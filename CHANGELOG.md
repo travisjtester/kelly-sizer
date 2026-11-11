@@ -3,6 +3,7 @@
 What changed, newest first, by pull request. Everything merged to `main` deploys to the [live app](https://kelly-sizer.streamlit.app).
 
 ## 2026-11-11
+- **You vs. the market** (#23): each journal entry records the market's odds beside yours (new columns `market_bear`, `market_bull`, `market_expiry`; older journals still load). After 10+ resolved calls with market odds, the journal scores both on the same calls and says whether your edge looks real. Fixes the calibration table showing 60% as "1%".
 - **Book and docs** (#19): two page citations corrected against the book's text (probability and risk vs. reward is p. 1; Shannon's no-trimming is pp. 81–82). The README's book table is split into what comes from the book and the tool's extensions. **Book mode** (`--book-mode`, app Settings): cash earns 0%, so a single bet's Kelly is exactly the book's f* = (bp − q)/b. Five-minute walkthrough, this changelog, and `views.example.csv` with the `as_of_price` and `horizon` columns.
 
 ## 2026-11-10

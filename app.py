@@ -479,10 +479,15 @@ n_log = len([t for t in tickers if t in store])
 if st.button(f"Log today's views ({n_log})", disabled=not (results_ready and n_log),
              width="stretch",
              help="Records each view with today's date and price. Size it first."):
-    resolved = ks.resolve_views(views, {**prices.ffill().iloc[-1].to_dict(), **prices_now})
+    px_log = {**prices.ffill().iloc[-1].to_dict(), **prices_now}
+    resolved = ks.resolve_views(views, px_log)
+    with st.spinner("Recording the market's odds beside yours…"):
+        smiles = {t: option_smile_for(t, round(px_log[t], 2), horizon, rf)
+                  for t in resolved.index if px_log.get(t)}
+        market = ks.market_check(views, px_log, horizon, rf, smiles)
     st.session_state.journal = journal = ks.append_journal(
-        journal, ks.journal_entries(resolved, horizon))
-    st.toast(f"Logged {len(resolved)} views")
+        journal, ks.journal_entries(resolved, horizon, market=market))
+    st.toast(f"Logged {len(resolved)} views, with the market's odds where options trade")
 
 if len(journal):
     j_px = latest_for(tuple(sorted(set(journal["ticker"]))))
@@ -500,9 +505,15 @@ if len(journal):
             calib.rename(columns={"bucket": "Bull odds you gave", "calls": "Calls",
                                   "predicted_bull": "Predicted", "actual_bull": "Came true"}),
             hide_index=True, width="stretch",
-            column_config={"Predicted": st.column_config.NumberColumn(format="%.0f%%"),
-                           "Came true": st.column_config.NumberColumn(format="%.0f%%")},
+            column_config={
+                "Predicted": st.column_config.NumberColumn(format="percent", step=0.01),
+                "Came true": st.column_config.NumberColumn(format="percent", step=0.01)},
         )
+        if jsum.get("market_verdict"):
+            st.markdown(f"**You vs. the market.** {jsum['market_verdict']}")
+            st.caption("Scored on the calls logged with the market's odds. The market's "
+                       "odds price the share price at the option expiry and carry a risk "
+                       "premium; your outcomes judge the thesis. Close, not identical.")
     view = entries[["date", "ticker", "status", "p_bull", "bull", "entry_price",
                     "return_since_entry", "horizon_ends", "outcome"]].copy()
     for col in ["p_bull", "bull", "return_since_entry"]:
