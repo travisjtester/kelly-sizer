@@ -133,3 +133,86 @@ def test_book_mode_toggle_puts_cash_at_zero(app):
     next(t for t in app.toggle if t.label.startswith("Book mode")).set_value(True)
     at = size(app)
     assert any("Risk-free 0.00% (book mode" in c.value for c in at.caption)
+
+
+# ---- saved data: a fake private repo in place of GitHub
+import github_store as gs  # noqa: E402
+
+SAVED_VIEWS = "ticker,p_bear,bear,p_base,base,bull,value\nTSM,0.2,0.4,0.4,0.15,0.8,\n"
+
+
+class MemoryStore:
+    repo = "me/kelly-data"
+
+    def __init__(self, files=None):
+        self.files = {p: (t, f"v{i}") for i, (p, t) in enumerate((files or {}).items())}
+        self.writes = []
+
+    def read(self, path):
+        return self.files.get(path, (None, None))
+
+    def write(self, path, text, message, sha):
+        if sha != self.files.get(path, (None, None))[1]:
+            raise gs.Conflict(path)
+        new = f"v{len(self.writes) + 10}"
+        self.files[path] = (text, new)
+        self.writes.append(path)
+        return new
+
+
+@pytest.fixture
+def saved(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    repo = MemoryStore({gs.VIEWS_PATH: SAVED_VIEWS})
+    monkeypatch.setattr(gs, "from_secrets", lambda secrets: (repo, "open sesame"))
+    return repo, AppTest.from_file(str(ROOT / "app.py"), default_timeout=180).run()
+
+
+def unlock(at, pw):
+    at.text_input[0].input(pw)
+    next(b for b in at.button if b.label == "Unlock").click().run()
+    return at
+
+
+def test_nothing_loads_until_the_passphrase(saved):
+    repo, at = saved
+    assert any("Unlock your saved" in e.label for e in at.expander)
+    assert at.session_state["views"] == {}
+    at = unlock(at, "wrong")
+    assert any("Wrong passphrase" in e.value for e in at.error)
+    assert at.session_state["views"] == {} and not repo.writes
+
+
+def test_unlock_loads_your_views_into_the_basket(saved):
+    repo, at = saved
+    at = unlock(at, "open sesame")
+    assert not at.exception
+    assert "TSM" in at.session_state["views"] and "TSM" in at.multiselect[0].value
+    assert any("save to your private repo (me/kelly-data)" in c.value for c in at.caption)
+    assert not repo.writes                          # loading alone doesn't write
+
+
+def test_changes_save_themselves(saved):
+    repo, at = saved
+    at = unlock(at, "open sesame")
+    at.session_state["views"]["KO"] = {"p_bear": .1, "bear": .15, "p_base": .6, "base": .12,
+                                      "bull": .3, "value": None}
+    at.run()
+    assert gs.VIEWS_PATH in repo.writes and "KO" in repo.files[gs.VIEWS_PATH][0]
+
+
+def test_two_devices_journal_entries_merge(saved):
+    repo, at = saved
+    at = unlock(at, "open sesame")
+    other = ks.journal_entries(ks.resolve_views(ks.normalize_views(pd.DataFrame(
+        {"ticker": ["MU"], "p_bear": [.3], "bear": [.5], "bull": [1.0]})), {"MU": 100.0}), 2.0,
+        on=date(2026, 11, 1))
+    repo.files[gs.JOURNAL_PATH] = (other.to_csv(index=False), "phone")   # saved elsewhere
+    mine = ks.journal_entries(ks.resolve_views(ks.normalize_views(pd.DataFrame(
+        {"ticker": ["KO"], "p_bear": [.1], "bear": [.15], "bull": [.3]})), {"KO": 60.0}), 2.0,
+        on=date(2026, 11, 2))
+    at.session_state["journal"] = ks.append_journal(at.session_state["journal"], mine)
+    at.run()
+    saved_tickers = set(ks.normalize_journal(pd.read_csv(
+        __import__("io").StringIO(repo.files[gs.JOURNAL_PATH][0]))).ticker)
+    assert saved_tickers == {"MU", "KO"}
