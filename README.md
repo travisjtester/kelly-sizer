@@ -13,12 +13,22 @@ One engine, two ways in: a **phone app** for sizing on the couch and a **command
 4. **Log it** to the conviction journal. When each horizon ends, record which scenario played out. The journal tells you whether your probabilities are calibrated, which decides whether you've earned bigger fractions.
 
 ## Five-minute walkthrough
-On the [live app](https://kelly-sizer.streamlit.app), with the example file. Each step answers one question.
+On the [live app](https://kelly-sizer.streamlit.app), with the example file. Each step answers one question. (Screenshots from the live app, November 2026, with one view on NVDA: 25% / −50% bear, 35% / +15% base, 40% / +150% bull.)
 
 1. **What does no edge look like?** Keep the default basket and tap **Size it** with no research. Every name uses CAPM: small, spread-out weights and mostly cash. Note the invested % and expected growth. That's your baseline.
+
+   <img src="docs/img/1-baseline.png" width="520" alt="No views: every name on CAPM, 68% invested, 9.3%/yr expected growth">
 2. **What does your research change?** Download [`views.example.csv`](views.example.csv), then **Your research → Load views CSV**. KO joins the basket and NVDA, ASML and KO now carry views. Size it again. Everything that moved away from the baseline is the edge your views claim.
+
+   <img src="docs/img/2-research.png" width="520" alt="Your research table with a bear/base/bull view on NVDA">
+
+   <img src="docs/img/3-sized.png" width="520" alt="Sized on your research: NVDA 20% at half Kelly, the rest CAPM">
 3. **Which bets depend on the bear case?** Read **What if I'm wrong?**. A **Fragile** name loses most of its size if the bear case is a little worse than you said.
+
+   <img src="docs/img/4-what-if-wrong.png" width="520" alt="What if I'm wrong: NVDA is Fragile; 10 more points of bear odds cut it from 20% to 0%">
 4. **Does the market agree?** Open **Market check** and turn on the toggle. Your odds sit beside the option-implied odds. Every gap of 10+ points is a claim you should be able to explain.
+
+   <img src="docs/img/5-market-check.png" width="520" alt="Market check: your NVDA odds beside the option-implied odds from the Jan 2029 chain">
 5. **Is it the edge or the shape?** In **Settings**, turn on **Neutral inputs**. Your views keep their shape but lose their edge, and the sizes fall back toward the baseline. Turn it off again.
 6. **Will you remember this call?** Under **Conviction journal**, tap **Log today's views**, then **Save journal CSV**. When each horizon ends, record what happened. After 10 resolved calls the journal tells you whether your odds are calibrated.
 
@@ -80,6 +90,7 @@ python kelly.py --screen --extra TSM ASML              # opt-in: S&P 500 no-edge
 | Long-run market return (CAPM) | Settings | `--market-return` | 10.68% |
 | Neutral inputs (test mode) | Settings | `--neutral` | off |
 | Book mode (cash earns 0%) | Settings | `--book-mode` | off |
+| Street starter for blank rows | Your research → Start blank rows from Street targets | `--street` | off |
 | Market check | Market check (after your odds) | `--market` | off |
 
 **Neutral inputs** scales each view so its expected return equals its CAPM return while keeping its shape (the spread between bear, base and bull). With the edge removed, sizes should land near the no-views baseline; whatever gap remains is the scenario shape alone. Use it to test a set of inputs, such as analyst targets, not to size.
@@ -104,6 +115,11 @@ KO,0.10,0.15,,,0.30,,"Two outcomes only: base left blank",,
 
 Bull odds = `1 − p_bear − p_base`. **Units:** use one style per file. The odds columns decide it: odds written as percents (`40`) mean the whole file is percents; decimals (`0.4`) mean decimals. A `%` sign always means percent. Older `p_win, upside, downside` files still load. Start from `views.example.csv`.
 
+
+### Street starter: a consensus starting point
+For names you haven't researched yet, **Start blank rows from Street targets** (CLI `--street`) turns analysts' 12-month price targets into a view you can edit: low → bear, mean → base, high → bull, with placeholder odds of 20 / 50 / 30. It never touches a view you've written.
+
+It's a starting point, not an edge. Sell-side targets lean bullish (the first live test sized them at 41%/yr expected growth, against 6.8% with no views), so each starter view is labeled, carries `horizon = 1` (a longer run flags it) and today's `as_of_price` (so it re-anchors as the price moves). A low target above the price isn't a broken thesis, so the bear case is set at no less than a 20% loss and you're told to write your own. Replace the odds and the bear case with your research; **Neutral inputs** and **Market check** help you test what's left. On the CLI the starter views are saved to `street_views_DATE.csv` for you to edit into `views.csv`.
 
 ### Market check: your odds vs. the market's
 Munger's winning bettors "look and sift the world for a mispriced bet" (pp. 209–210). Option prices are the market's odds; your edge is where your odds differ. **Market check** shows, for each name you have a view on, the option-implied chance of finishing below your bear price and above your bull price, beside your own odds, with a sentence wherever the gap is 10 points or more.

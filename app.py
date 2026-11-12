@@ -116,6 +116,14 @@ def _same(a, b) -> bool:
     return (a_na and b_na) or (not a_na and not b_na and abs(float(a) - float(b)) < 1e-6)
 
 
+def _views_changed(a: dict, b: dict) -> bool:
+    """True if any view was added, removed or edited (blanks compare equal)."""
+    if set(a) != set(b):
+        return True
+    return any(not _same(a[t].get(k), b[t].get(k))
+               for t in a for k in set(a[t]) | set(b[t]))
+
+
 def _pct(x):
     return None if x is None or pd.isna(x) else round(float(x) * 100, 4)
 
@@ -336,6 +344,7 @@ with st.expander("Your research (views)", expanded=bool(store)):
         },
     )
     problems = []
+    before = {t: dict(v) for t, v in store.items()}
     for _, r in edited.iterrows():
         entry = {k: (r[k] / 100 if k != "value" else r[k]) if pd.notna(r[k]) else None
                  for k in VIEW_FIELDS}
@@ -357,6 +366,11 @@ with st.expander("Your research (views)", expanded=bool(store)):
             problems.append(f"**{r['ticker']}**: {e}")
     for msg in problems:
         st.error(msg)
+    # The table's computed columns (bull odds, price, margin of safety) were
+    # built from the views as they stood before this edit; rerun once so they
+    # reflect it. Blanks compare equal, so this settles after one pass.
+    if not problems and _views_changed(before, store):
+        st.rerun()
 
     up, down = st.columns(2)
     file = up.file_uploader("Load views CSV", type="csv", key="views_upload",
@@ -378,6 +392,24 @@ with st.expander("Your research (views)", expanded=bool(store)):
         csv = _views_csv(store)
         down.download_button("Save views CSV", csv, "views.csv", "text/csv",
                              width="stretch")
+
+    # ---- Street starter: a labeled consensus starting point for blank rows
+    blank = [t for t in tickers if t not in store and t != ks.BENCHMARK]
+    if blank and st.button(
+            f"Start blank rows from Street targets ({len(blank)})", width="stretch",
+            help="Fills names without a view from analysts' low / mean / high 12-month "
+                 "price targets, with placeholder odds (20 / 50 / 30). A consensus "
+                 "starting point to edit, not an edge."):
+        with st.spinner("Reading analyst price targets…"):
+            starter, notes = ks.street_views(ks.street_targets(blank))
+        store.update({t: {k: r[k] for k in STORE_FIELDS} for t, r in starter.iterrows()})
+        st.session_state._upload_notes = [
+            f"Filled {len(starter)} of {len(blank)} blank rows from Street targets: "
+            "12-month consensus, which leans bullish, with placeholder odds. That's the "
+            "market's view, not your edge: replace the odds and the bear case with your own "
+            "research. Neutral inputs and Market check help test them.",
+            *notes]
+        st.rerun()
 
 c1, c2 = st.columns(2)
 fraction_label = c1.radio("Kelly fraction", list(FRACTIONS), index=1, horizontal=True)

@@ -3,6 +3,7 @@
 What changed, newest first, by pull request. Everything merged to `main` deploys to the [live app](https://kelly-sizer.streamlit.app).
 
 ## 2026-11-11
+- **Street starter, screenshots, table fix** (#27): blank rows can start from analysts' low / mean / high 12-month targets, with placeholder odds, `horizon = 1` and `as_of_price`, labeled as consensus. App button in Your research; CLI `--street` (saved to `street_views_DATE.csv`). Never overwrites a view you wrote. README walkthrough now has screenshots of the live app. Fix: the research table's computed columns (bull odds, price, margin of safety) lagged one edit behind.
 - **License** (#26): MIT. README notes the book's text isn't reproduced here, and that the tool isn't financial advice.
 - **Dependabot** (#25): pip minimums are raised only when they block a newer version, keeping Python 3.11 supported.
 - **Saved data** (#24): with storage set up in Streamlit secrets, the app loads your journal and views from a private GitHub repo once you enter your passphrase, and saves every change as you go (one commit each). Journal entries from two devices merge. The CLI uses the same files from a clone of that repo. Without secrets nothing changes. Also corrects the in-app method note, which still said CAPM used the 10-year Treasury.

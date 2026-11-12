@@ -17,7 +17,7 @@ def app(tmp_path, monkeypatch):
 
 def size(at, tickers=("NVDA", "ASML", "KO", "MSFT", "VOO")):
     at.multiselect[0].set_value(list(tickers)).run()
-    at.button[0].click().run()
+    next(b for b in at.button if b.label == "Size it").click().run()
     assert not at.exception, at.exception
     return at
 
@@ -216,3 +216,19 @@ def test_two_devices_journal_entries_merge(saved):
     saved_tickers = set(ks.normalize_journal(pd.read_csv(
         __import__("io").StringIO(repo.files[gs.JOURNAL_PATH][0]))).ticker)
     assert saved_tickers == {"MU", "KO"}
+
+
+def test_street_button_fills_only_blank_rows(app, monkeypatch):
+    class T:
+        def __init__(self, t):
+            self.info = {"currentPrice": 100.0, "targetLowPrice": 70.0,
+                         "targetMeanPrice": 120.0, "targetHighPrice": 150.0}
+    monkeypatch.setattr("yfinance.Ticker", T)
+    app.session_state["views"] = {
+        "NVDA": {"p_bear": .25, "bear": .5, "p_base": .35, "base": .15, "bull": 1.0, "value": None}}
+    at = app.run()
+    next(b for b in at.button if b.label.startswith("Start blank rows")).click().run()
+    views = at.session_state["views"]
+    assert views["NVDA"]["bear"] == .5                     # your view untouched
+    assert views["ASML"]["horizon"] == 1 and views["ASML"]["p_bear"] == pytest.approx(.2)
+    assert any("not your edge" in w.value for w in at.warning)
